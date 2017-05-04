@@ -1,15 +1,12 @@
-
 <%
-    from pwnlib.shellcraft.aarch64.linux import syscall
+  from pwnlib import shellcraft
 %>
-<%page args="file, oflag, vararg"/>
+<%page args="filename, mode='O_RDONLY'"/>
 <%docstring>
-Invokes the syscall open.  See 'man 2 open' for more information.
-
-Arguments:
-    file(char): file
-    oflag(int): oflag
-    vararg(int): vararg
+Opens a file
 </%docstring>
-
-    ${syscall('SYS_open', file, oflag, vararg)}
+<%
+  AT_FDCWD=-100
+%>
+    ${shellcraft.pushstr(filename)}
+    ${shellcraft.syscall('SYS_openat', AT_FDCWD, 'sp', mode, 0)}

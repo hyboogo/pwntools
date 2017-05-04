@@ -1,8 +1,49 @@
 """Exposes functionality for manipulating ELF files
+
+
+Stop hard-coding things!  Look them up at runtime with :mod:`pwnlib.elf`.
+
+Example Usage
+-------------
+
+.. code-block:: python
+
+    >>> e = ELF('/bin/cat')
+    >>> print hex(e.address) #doctest: +SKIP
+    0x400000
+    >>> print hex(e.symbols['write']) #doctest: +SKIP
+    0x401680
+    >>> print hex(e.got['write']) #doctest: +SKIP
+    0x60b070
+    >>> print hex(e.plt['write']) #doctest: +SKIP
+    0x401680
+
+You can even patch and save the files.
+
+.. code-block:: python
+
+    >>> e = ELF('/bin/cat')
+    >>> e.read(e.address+1, 3)
+    'ELF'
+    >>> e.asm(e.address, 'ret')
+    >>> e.save('/tmp/quiet-cat')
+    >>> disasm(file('/tmp/quiet-cat','rb').read(1))
+    '   0:   c3                      ret'
+
+Module Members
+--------------
 """
+from __future__ import absolute_import
+
+import codecs
+import collections
+import gzip
 import mmap
 import os
+import re
+import StringIO
 import subprocess
+
 from collections import namedtuple
 
 from elftools.elf.constants import E_FLAGS
@@ -10,109 +51,286 @@ from elftools.elf.constants import P_FLAGS
 from elftools.elf.constants import SHN_INDICES
 from elftools.elf.descriptions import describe_e_type
 from elftools.elf.elffile import ELFFile
+from elftools.elf.enums import ENUM_P_TYPE
 from elftools.elf.gnuversions import GNUVerDefSection
 from elftools.elf.relocation import RelocationSection
 from elftools.elf.sections import SymbolTableSection
 
-from .. import adb
-from ..asm import *
-from ..context import LocalContext
-from ..context import context
-from ..log import getLogger
-from ..qemu import get_qemu_arch
-from ..term import text
-from ..tubes.process import process
-from ..util import misc
-from ..util import packing
-from ..util import sh_string
+import intervaltree
+
+from pwnlib import adb
+from pwnlib.asm import *
+from pwnlib.context import LocalContext
+from pwnlib.context import context
+from pwnlib.elf.config import kernel_configuration
+from pwnlib.elf.config import parse_kconfig
+from pwnlib.elf.plt import emulate_plt_instructions
+from pwnlib.log import getLogger
+from pwnlib.qemu import get_qemu_arch
+from pwnlib.term import text
+from pwnlib.tubes.process import process
+from pwnlib.util import misc
+from pwnlib.util import packing
+from pwnlib.util.sh_string import sh_string
 
 log = getLogger(__name__)
 
 __all__ = ['load', 'ELF']
 
-Function = namedtuple('Function', 'address size')
+class Function(object):
+    """Encapsulates information about a function in an :class:`.ELF` binary.
+
+    Arguments:
+        name(str): Name of the function
+        address(int): Address of the function
+        size(int): Size of the function, in bytes
+        elf(ELF): Encapsulating ELF object
+    """
+    def __init__(self, name, address, size, elf=None):
+        #: Name of the function
+        self.name = name
+
+        #: Address of the function in the encapsulating ELF
+        self.address = address
+
+        #: Size of the function, in bytes
+        self.size = size
+
+        #: Encapsulating ELF object
+        self.elf = elf
+
+    def __repr__(self):
+        return '%s(name=%r, address=%#x, size=%#x, elf=%r)' % (
+            self.__class__.__name__,
+            self.name,
+            self.address,
+            self.size,
+            self.elf
+            )
+
+    def __flat__(self):
+        return packing.pack(self.address)
+
+    def disasm(self):
+        return self.elf.disasm(self.address, self.size)
 
 def load(*args, **kwargs):
     """Compatibility wrapper for pwntools v1"""
     return ELF(*args, **kwargs)
 
 class dotdict(dict):
+    """Wrapper to allow dotted access to dictionary elements.
+
+    Is a real :class:`dict` object, but also serves up keys as attributes
+    when reading attributes.
+
+    Supports recursive instantiation for keys which contain dots.
+
+    Example:
+
+        >>> x = pwnlib.elf.elf.dotdict()
+        >>> isinstance(x, dict)
+        True
+        >>> x['foo'] = 3
+        >>> x.foo
+        3
+        >>> x['bar.baz'] = 4
+        >>> x.bar.baz
+        4
+    """
     def __getattr__(self, name):
-        return self[name]
+        if name in self:
+            return self[name]
+
+        name_dot = name + '.'
+        name_len = len(name_dot)
+        subkeys = {k[name_len:]: self[k] for k in self if k.startswith(name_dot)}
+
+        if subkeys:
+            return dotdict(subkeys)
+
+        return getattr(super(dotdict, self), name)
 
 class ELF(ELFFile):
     """Encapsulates information about an ELF file.
-
-    :ivar path: Path to the binary on disk
-    :ivar symbols:  Dictionary of {name: address} for all symbols in the ELF
-    :ivar plt:      Dictionary of {name: address} for all functions in the PLT
-    :ivar got:      Dictionary of {name: address} for all function pointers in the GOT
-    :ivar libs:     Dictionary of {path: address} for each shared object required to load the ELF
 
     Example:
 
         .. code-block:: python
 
-           bash = ELF(which('bash'))
-           hex(bash.symbols['read'])
-           # 0x41dac0
-           hex(bash.plt['read'])
-           # 0x41dac0
-           u32(bash.read(bash.got['read'], 4))
-           # 0x41dac6
-           print disasm(bash.read(bash.plt['read'],16), arch='amd64')
-           # 0:   ff 25 1a 18 2d 00       jmp    QWORD PTR [rip+0x2d181a]        # 0x2d1820
-           # 6:   68 59 00 00 00          push   0x59
-           # b:   e9 50 fa ff ff          jmp    0xfffffffffffffa60
+           >>> bash = ELF(which('bash'))
+           >>> hex(bash.symbols['read'])
+           0x41dac0
+           >>> hex(bash.plt['read'])
+           0x41dac0
+           >>> u32(bash.read(bash.got['read'], 4))
+           0x41dac6
+           >>> print bash.disasm(bash.plt.read, 16)
+           0:   ff 25 1a 18 2d 00       jmp    QWORD PTR [rip+0x2d181a]        # 0x2d1820
+           6:   68 59 00 00 00          push   0x59
+           b:   e9 50 fa ff ff          jmp    0xfffffffffffffa60
     """
-    def __init__(self, path):
+
+    # These class-level intitializers are only for ReadTheDocs
+    bits = 32
+    bytes = 4
+    path = '/path/to/the/file'
+    symbols = {}
+    got = {}
+    plt = {}
+    functions = {}
+    endian = 'little'
+    address = 0x400000
+
+    # Whether to fill gaps in memory with zeroed pages
+    _fill_gaps = True
+
+
+    def __init__(self, path, checksec=True):
         # elftools uses the backing file for all reads and writes
         # in order to permit writing without being able to write to disk,
         # mmap() the file.
+
+        #: :class:`file`: Open handle to the ELF file on disk
         self.file = open(path,'rb')
+
+        #: :class:`mmap.mmap`: Memory-mapped copy of the ELF file on disk
         self.mmap = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_COPY)
 
         super(ELF,self).__init__(self.mmap)
 
-        #: Path to the file
-        self.path = os.path.abspath(path)
-        #: Architecture of the file
-        self.arch = self.get_machine_arch().lower()
+        #: IntervalTree which maps all of the loaded memory segments
+        self.memory = intervaltree.IntervalTree()
+        self._populate_memory()
 
-        #: Endianness of the file
+        #: :class:`str`: Path to the file
+        self.path = os.path.abspath(path)
+
+        #: :class:`str`: Architecture of the file (e.g. ``'i386'``, ``'arm'``).
+        #:
+        #: See: :attr:`.ContextType.arch`
+        self.arch = self.get_machine_arch()
+        if isinstance(self.arch, (str, unicode)):
+            self.arch = self.arch.lower()
+
+        #: :class:`dotdict` of ``name`` to ``address`` for all symbols in the ELF
+        self.symbols = dotdict()
+
+        #: :class:`dotdict` of ``name`` to ``address`` for all Global Offset Table (GOT) entries
+        self.got = dotdict()
+
+        #: :class:`dotdict` of ``name`` to ``address`` for all Procedure Linkate Table (PLT) entries
+        self.plt = dotdict()
+
+        #: :class:`dotdict` of ``name`` to :class:`.Function` for each function in the ELF
+        self.functions = dotdict()
+
+        #: :class:`dict`: Linux kernel configuration, if this is a Linux kernel image
+        self.config = {}
+
+        #: :class:`tuple`: Linux kernel version, if this is a Linux kernel image
+        self.version = (0,)
+
+        #: :class:`str`: Linux kernel build commit, if this is a Linux kernel image
+        self.build = ''
+
+        #: :class:`str`: Endianness of the file (e.g. ``'big'``, ``'little'``)
         self.endian = {
             'ELFDATANONE': 'little',
             'ELFDATA2LSB': 'little',
             'ELFDATA2MSB': 'big'
         }[self['e_ident']['EI_DATA']]
 
-        #: Bit-ness of the file
+        #: :class:`int`: Bit-ness of the file
         self.bits = self.elfclass
+
+        #: :class:`int`: Pointer width, in bytes
         self.bytes = self.bits / 8
 
         if self.arch == 'mips':
-            if self.header['e_flags'] & E_FLAGS.EF_MIPS_ARCH_64 \
-            or self.header['e_flags'] & E_FLAGS.EF_MIPS_ARCH_64R2:
+            mask = lambda a, b: a & b == b
+            flags = self.header['e_flags']
+
+            if mask(flags, E_FLAGS.EF_MIPS_ARCH_32) \
+            or mask(flags, E_FLAGS.EF_MIPS_ARCH_32R2):
+                pass
+            elif mask(flags, E_FLAGS.EF_MIPS_ARCH_64) \
+            or mask(flags, E_FLAGS.EF_MIPS_ARCH_64R2):
                 self.arch = 'mips64'
                 self.bits = 64
 
-        if self.elftype == 'DYN':
-            self._address = 0
-        else:
-            self._address = min(filter(bool, (s.header.p_vaddr for s in self.segments)))
+        self._address = 0
+        if self.elftype != 'DYN':
+            for seg in self.iter_segments_by_type('PT_LOAD'):
+                addr = seg.header.p_vaddr
+                if addr == 0:
+                    continue
+                if addr < self._address or self._address == 0:
+                    self._address = addr
+
         self.load_addr = self._address
 
-        self._populate_got_plt()
-        self._populate_symbols()
+        # Try to figure out if we have a kernel configuration embedded
+        IKCFG_ST='IKCFG_ST'
+
+        for start in self.search(IKCFG_ST):
+            start += len(IKCFG_ST)
+            stop = self.search('IKCFG_ED').next()
+
+            fileobj = StringIO.StringIO(self.read(start, stop-start))
+
+            # Python gzip throws an exception if there is non-Gzip data
+            # after the Gzip stream.
+            #
+            # Catch the exception, and just deal with it.
+            with gzip.GzipFile(fileobj=fileobj) as gz:
+                config = gz.read()
+
+            if config:
+                self.config = parse_kconfig(config)
+
+        #: ``True`` if the ELF is a statically linked executable
+        self.statically_linked = bool(self.elftype == 'EXEC' and self.load_addr)
+
+        #: ``True`` if the ELF is an executable
+        self.executable = bool(self.elftype == 'EXEC')
+
+        for seg in self.iter_segments_by_type('PT_INTERP'):
+            self.executable = True
+            self.statically_linked = False
+
+        #: ``True`` if the ELF is a shared library
+        self.library = not self.executable and self.elftype == 'DYN'
+
+        try:
+            self._populate_symbols()
+        except Exception as e:
+            log.warn("Could not populate symbols: %s", e)
+
+        try:
+            self._populate_got()
+        except Exception as e:
+            log.warn("Could not populate GOT: %s", e)
+
+        try:
+            self._populate_plt()
+        except Exception as e:
+            log.warn("Could not populate PLT: %s", e)
+
+        self._populate_synthetic_symbols()
         self._populate_libraries()
         self._populate_functions()
+        self._populate_kernel_version()
 
-        self._describe()
+        if checksec:
+            self._describe()
 
     @staticmethod
     @LocalContext
     def from_assembly(assembly, *a, **kw):
-        """Given an assembly listing, return a fully loaded ELF object
+        """from_assembly(assembly) -> ELF
+
+        Given an assembly listing, return a fully loaded ELF object
         which contains that assembly at its entry point.
 
         Arguments:
@@ -134,7 +352,9 @@ class ELF(ELFFile):
     @staticmethod
     @LocalContext
     def from_bytes(bytes, *a, **kw):
-        r"""Given a sequence of bytes, return a fully loaded ELF object
+        r"""from_bytes(bytes) -> ELF
+
+        Given a sequence of bytes, return a fully loaded ELF object
         which contains those bytes at its entry point.
 
         Arguments:
@@ -152,10 +372,40 @@ class ELF(ELFFile):
         return ELF(make_elf(bytes, extract=False, *a, **kw))
 
     def process(self, argv=[], *a, **kw):
+        """process(argv=[], *a, **kw) -> process
+
+        Execute the binary with :class:`.process`.  Note that ``argv``
+        is a list of arguments, and should not include ``argv[0]``.
+
+        Arguments:
+            argv(list): List of arguments to the binary
+            *args: Extra arguments to :class:`.process`
+            **kwargs: Extra arguments to :class:`.process`
+
+        Returns:
+            :class:`.process`
+        """
+
         p = process
         if context.os == 'android':
             p = adb.process
         return p([self.path] + argv, *a, **kw)
+
+    def debug(self, argv=[], *a, **kw):
+        """debug(argv=[], *a, **kw) -> tube
+
+        Debug the ELF with :func:`.gdb.debug`.
+
+        Arguments:
+            argv(list): List of arguments to the binary
+            *args: Extra arguments to :func:`.gdb.debug`
+            **kwargs: Extra arguments to :func:`.gdb.debug`
+
+        Returns:
+            :class:`.tube`: See :func:`.gdb.debug`
+        """
+        import pwnlib.gdb
+        return pwnlib.gdb.debug([self.path] + argv, *a, **kw)
 
     def _describe(self):
         log.info_once('\n'.join((repr(self.path),
@@ -182,37 +432,39 @@ class ELF(ELFFile):
 
     @property
     def entry(self):
-        """Entry point to the ELF"""
+        """:class:`int`: Address of the entry point for the ELF"""
         return self.address + (self.header.e_entry - self.load_addr)
     entrypoint = entry
     start      = entry
 
     @property
-    def elfclass(self):
-        """ELF class (32 or 64).
-
-        .. note::
-            Set during ``ELFFile._identify_file``
-        """
-        return self._elfclass
-
-    @elfclass.setter
-    def elfclass(self, newvalue):
-        self._elfclass = newvalue
-
-    @property
     def elftype(self):
-        """ELF type (EXEC, DYN, etc)"""
+        """:class:`str`: ELF type (``EXEC``, ``DYN``, etc)"""
         return describe_e_type(self.header.e_type).split()[0]
 
     @property
     def segments(self):
-        """A list of all segments in the ELF"""
+        """
+        :class:`list`: A list of :class:`elftools.elf.segments.Segment` objects
+            for the segments in the ELF.
+        """
         return list(self.iter_segments())
+
+    def iter_segments_by_type(self, t):
+        """
+        Yields:
+            Segments matching the specified type.
+        """
+        for seg in self.iter_segments():
+            if t == seg.header.p_type or t in str(seg.header.p_type):
+                yield seg
 
     @property
     def sections(self):
-        """A list of all sections in the ELF"""
+        """
+        :class:`list`: A list of :class:`elftools.elf.sections.Section` objects
+            for the segments in the ELF.
+        """
         return list(self.iter_sections())
 
     @property
@@ -222,18 +474,35 @@ class ELF(ELFFile):
 
     @property
     def sym(self):
+        """:class:`dotdict`: Alias for :attr:`.ELF.symbols`"""
         return self.symbols
 
     @property
     def address(self):
-        """Address of the lowest segment loaded in the ELF.
-        When updated, cascades updates to segment vaddrs, section addrs, symbols, plt, and got.
+        """:class:`int`: Address of the lowest segment loaded in the ELF.
 
-        >>> bash = ELF(which('bash'))
-        >>> old = bash.symbols['read']
-        >>> bash.address += 0x1000
-        >>> bash.symbols['read'] == old + 0x1000
-        True
+        When updated, the addresses of the following fields are also updated:
+
+        - :attr:`~.ELF.symbols`
+        - :attr:`~.ELF.got`
+        - :attr:`~.ELF.plt`
+        - :attr:`~.ELF.functions`
+
+        However, the following fields are **NOT** updated:
+
+        - :attr:`~.ELF.segments`
+        - :attr:`~.ELF.sections`
+
+        Example:
+
+            >>> bash = ELF('/bin/bash')
+            >>> read = bash.symbols['read']
+            >>> text = bash.get_section_by_name('.text').header.sh_addr
+            >>> bash.address += 0x1000
+            >>> read + 0x1000 == bash.symbols['read']
+            True
+            >>> text == bash.get_section_by_name('.text').header.sh_addr
+            True
         """
         return self._address
 
@@ -246,22 +515,38 @@ class ELF(ELFFile):
         self.plt     = dotdict({k:update(v) for k,v in self.plt.items()})
         self.got     = dotdict({k:update(v) for k,v in self.got.items()})
 
+        # Update our view of memory
+        memory = intervaltree.IntervalTree()
+
+        for begin, end, data in self.memory:
+            memory.addi(update(begin),
+                        update(end),
+                        data)
+
+        self.memory = memory
+
         self._address = update(self.address)
 
     def section(self, name):
-        """Gets data for the named section
+        """section(name) -> bytes
+
+        Gets data for the named section
 
         Arguments:
             name(str): Name of the section
 
         Returns:
-            String containing the bytes for that section
+            :class:`str`: String containing the bytes for that section
         """
         return self.get_section_by_name(name).data()
 
     @property
     def rwx_segments(self):
-        """Returns: list of all segments which are writeable and executable."""
+        """:class:`list`: List of all segments which are writeable and executable.
+
+        See:
+            :attr:`.ELF.segments`
+        """
         if not self.nx:
             return self.writable_segments
 
@@ -270,7 +555,11 @@ class ELF(ELFFile):
 
     @property
     def executable_segments(self):
-        """Returns: list of all segments which are executable."""
+        """:class:`list`: List of all segments which are executable.
+
+        See:
+            :attr:`.ELF.segments`
+        """
         if not self.nx:
             return list(self.segments)
 
@@ -278,26 +567,33 @@ class ELF(ELFFile):
 
     @property
     def writable_segments(self):
-        """Returns: list of all segments which are writeable"""
+        """:class:`list`: List of all segments which are writeable.
+
+        See:
+            :attr:`.ELF.segments`
+        """
         return [s for s in self.segments if s.header.p_flags & P_FLAGS.PF_W]
 
     @property
     def non_writable_segments(self):
-        """Returns: list of all segments which are NOT writeable"""
+        """:class:`list`: List of all segments which are NOT writeable.
+
+        See:
+            :attr:`.ELF.segments`
+        """
         return [s for s in self.segments if not s.header.p_flags & P_FLAGS.PF_W]
 
     @property
     def libc(self):
-        """If the ELF imports any libraries which contain 'libc.so',
+        """:class:`.ELF`: If this :class:`.ELF` imports any libraries which contain ``'libc[.-]``,
         and we can determine the appropriate path to it on the local
-        system, returns an ELF object pertaining to that libc.so.
+        system, returns a new :class:`.ELF` object pertaining to that library.
 
-        Otherwise, returns ``None``.
+        If not found, the value will be :const:`None`.
         """
         for lib in self.libs:
             if '/libc.' in lib or '/libc-' in lib:
                 return ELF(lib)
-
 
     def _populate_libraries(self):
         """
@@ -313,7 +609,7 @@ class ELF(ELFFile):
             return
 
         try:
-            cmd = sh_string.sh_command_with('ulimit -s unlimited; LD_TRACE_LOADED_OBJECTS=1 LD_WARN=1 LD_BIND_NOW=1 %s 2>/dev/null', self.path)
+            cmd = 'ulimit -s unlimited; LD_TRACE_LOADED_OBJECTS=1 LD_WARN=1 LD_BIND_NOW=1 %s 2>/dev/null' % sh_string(self.path)
 
             data = subprocess.check_output(cmd, shell = True, stderr = subprocess.STDOUT)
             libs = misc.parse_ldd_output(data)
@@ -337,7 +633,6 @@ class ELF(ELFFile):
         by function name that map to a tuple consisting of the func address and size
         in bytes.
         """
-        self.functions = dict()
         for sec in self.sections:
             if not isinstance(sec, SymbolTableSection):
                 continue
@@ -348,152 +643,241 @@ class ELF(ELFFile):
                     continue
                 if sym.entry.st_info['type'] == 'STT_FUNC' and sym.entry.st_size != 0:
                     name = sym.name
+                    try:
+                        name = codecs.encode(name, 'latin-1')
+                    except Exception:
+                        pass
                     if name not in self.symbols:
                         continue
                     addr = self.symbols[name]
                     size = sym.entry.st_size
-                    self.functions[name] = Function(addr, size)
+                    self.functions[name] = Function(name, addr, size, self)
 
     def _populate_symbols(self):
         """
         >>> bash = ELF(which('bash'))
-        >>> bash.symbols['_start'] == bash.header.e_entry
+        >>> bash.symbols['_start'] == bash.entry
         True
         """
-        # By default, have 'symbols' include everything in the PLT.
-        #
-        # This way, elf.symbols['write'] will be a valid address to call
-        # for write().
-        self.symbols = dotdict(self.plt)
 
+        # Populate all of the "normal" symbols from the symbol tables
         for section in self.sections:
             if not isinstance(section, SymbolTableSection):
                 continue
 
             for symbol in section.iter_symbols():
-                if not symbol.entry.st_value:
+                value = symbol.entry.st_value
+                if not value:
+                    continue
+                self.symbols[symbol.name] = value
+
+    def _populate_synthetic_symbols(self):
+        """Adds symbols from the GOT and PLT to the symbols dictionary.
+
+        Does not overwrite any existing symbols, and prefers PLT symbols.
+
+        Synthetic plt.xxx and got.xxx symbols are added for each PLT and
+        GOT entry, respectively.
+
+        Example:bash.
+
+            >>> bash = ELF(which('bash'))
+            >>> bash.symbols.wcscmp == bash.plt.wcscmp
+            True
+            >>> bash.symbols.wcscmp == bash.symbols.plt.wcscmp
+            True
+            >>> bash.symbols.stdin  == bash.got.stdin
+            True
+            >>> bash.symbols.stdin  == bash.symbols.got.stdin
+            True
+        """
+        for symbol, address in self.plt.items():
+            self.symbols.setdefault(symbol, address)
+            self.symbols['plt.' + symbol] = address
+
+        for symbol, address in self.got.items():
+            self.symbols.setdefault(symbol, address)
+            self.symbols['got.' + symbol] = address
+
+    def _populate_got(self):
+        """Loads the symbols for all relocations"""
+        # Statically linked implies no relocations, since there is no linker
+        # Could always be self-relocating like Android's linker *shrug*
+        if self.statically_linked:
+            return
+
+        for section in self.iter_sections():
+            # We are only interested in relocations
+            if not isinstance(section, RelocationSection):
+                continue
+
+            # Only get relocations which link to another section (for symbols)
+            if section.header.sh_link == SHN_INDICES.SHN_UNDEF:
+                continue
+
+            symbols = self.get_section(section.header.sh_link)
+
+            for rel in section.iter_relocations():
+                sym_idx  = rel.entry.r_info_sym
+
+                if not sym_idx:
                     continue
 
-                self.symbols[symbol.name] = symbol.entry.st_value
+                symbol = symbols.get_symbol(sym_idx)
 
-        # Add 'plt.foo' and 'got.foo' to the symbols for entries,
-        # iff there is no symbol for that address
-        for sym, addr in self.plt.items():
-            if addr not in self.symbols.values():
-                self.symbols['plt.%s' % sym] = addr
+                if symbol and symbol.name:
+                    self.got[symbol.name] = rel.entry.r_offset
 
-        for sym, addr in self.got.items():
-            if addr not in self.symbols.values():
-                self.symbols['got.%s' % sym] = addr
+        if self.arch == 'mips':
+            try:
+                self._populate_mips_got()
+            except Exception as e:
+                log.warn("Could not populate MIPS GOT: %s", e)
 
+        if not self.got:
+            log.warn("Did not find any GOT entries")
 
-    def _populate_got_plt(self):
-        """Loads the GOT and the PLT symbols and addresses.
+    def _populate_mips_got(self):
+        self._mips_got = {}
+        strings = self.get_section(self.header.e_shstrndx)
 
-        The following doctest checks the valitidy of the addresses.
-        This assumes that each GOT entry points to its PLT entry,
-        usually +6 bytes but could be anywhere within 0-16 bytes.
+        ELF_MIPS_GNU_GOT1_MASK = 0x80000000
 
-        >>> from pwnlib.util.packing import unpack
-        >>> bash = ELF(which('bash'))
-        >>> def validate_got_plt(sym):
-        ...     got      = bash.got[sym]
-        ...     plt      = bash.plt[sym]
-        ...     got_addr = unpack(bash.read(got, bash.elfclass/8), bash.elfclass)
-        ...     return got_addr in range(plt,plt+0x10)
-        ...
-        >>> all(map(validate_got_plt, bash.got.keys()))
-        True
+        if self.bits == 64:
+            ELF_MIPS_GNU_GOT1_MASK <<= 32
+
+        # Beginning of the GOT
+        got = self.dynamic_value_by_tag('DT_PLTGOT') or 0
+
+        # Find the beginning of the GOT pointers
+        got1_mask = (self.unpack(got) & ELF_MIPS_GNU_GOT1_MASK)
+        i = 2 if got1_mask else 1
+        self._mips_skip = i
+
+        # We don't care about local GOT entries, skip them
+        local_gotno = self.dynamic_value_by_tag('DT_MIPS_LOCAL_GOTNO')
+        got += local_gotno * context.bytes
+
+        # Iterate over the dynamic symbol table
+        dynsym = self.get_section_by_name('.dynsym')
+        symbol_iter = dynsym.iter_symbols()
+
+        # 'gotsym' is the index of the first GOT symbol
+        gotsym = self.dynamic_value_by_tag('DT_MIPS_GOTSYM')
+        for i in range(gotsym):
+            symbol_iter.next()
+
+        # 'symtabno' is the total number of symbols
+        symtabno = self.dynamic_value_by_tag('DT_MIPS_SYMTABNO')
+
+        for i in range(symtabno - gotsym):
+            symbol = symbol_iter.next()
+            self._mips_got[i + gotsym] = got
+            self.got[symbol.name] = got
+            got += self.bytes
+
+    def _populate_plt(self):
+        """Loads the PLT symbols
+
+        >>> path = pwnlib.data.elf.path
+        >>> for test in glob(os.path.join(path, 'test-*')):
+        ...     test = ELF(test)
+        ...     assert '__stack_chk_fail' in test.got, test
+        ...     if test.arch != 'ppc':
+        ...         assert '__stack_chk_fail' in test.plt, test
         """
-        plt = self.get_section_by_name('.plt')
-        got = self.get_section_by_name('.got')
-
-        self.got = {}
-        self.plt = {}
-
-        if not plt:
+        if self.statically_linked:
+            log.debug("%r is statically linked, skipping GOT/PLT symbols" % self.path)
             return
 
-        # Find the relocation section for PLT
-        try:
-            rel_plt = next(s for s in self.sections if
-                            s.header.sh_info == self.sections.index(plt) and
-                            isinstance(s, RelocationSection))
-        except StopIteration:
-            # Evidently whatever android-ndk uses to build binaries zeroes out sh_info for rel.plt
-            rel_plt = self.get_section_by_name('.rel.plt') or self.get_section_by_name('.rela.plt')
-
-        if not rel_plt:
-            log.warning("Couldn't find relocations against PLT to get symbols")
+        if not self.got:
+            log.debug("%r doesn't have any GOT symbols, skipping PLT" % self.path)
             return
 
-        if rel_plt.header.sh_link != SHN_INDICES.SHN_UNDEF:
-            # Find the symbols for the relocation section
-            sym_rel_plt = self.sections[rel_plt.header.sh_link]
+        # This element holds an address associated with the procedure linkage table
+        # and/or the global offset table.
+        #
+        # Zach's note: This corresponds to the ".got.plt" section, in a PIE non-RELRO binary.
+        #              This corresponds to the ".got" section, in a PIE full-RELRO binary.
+        #              In particular, this is where EBX points when it points into the GOT.
+        dt_pltgot = self.dynamic_value_by_tag('DT_PLTGOT') or 0
 
-            # Populate the GOT
-            for rel in rel_plt.iter_relocations():
-                sym_idx  = rel.entry.r_info_sym
-                symbol   = sym_rel_plt.get_symbol(sym_idx)
-                name     = symbol.name
+        # There are two PLTs we may need to search
+        plt = self.get_section_by_name('.plt')          # <-- Functions only
+        plt_got = self.get_section_by_name('.plt.got')  # <-- Functions used as data
+        plt_mips = self.get_section_by_name('.MIPS.stubs')
 
-                self.got[name] = rel.entry.r_offset
+        # Invert the GOT symbols we already have, so we can look up by address
+        inv_symbols = {v:k for k,v in self.got.items()}
+        inv_symbols.update({v:k for k,v in self.symbols.items()})
 
-        # Depending on the architecture, the beginning of the .plt will differ
-        # in size, and each entry in the .plt will also differ in size.
-        offset     = None
-        multiplier = None
+        with context.local(arch=self.arch, bits=self.bits, endian=self.endian):
+            for section in (plt, plt_got, plt_mips):
+                if not section:
+                    continue
 
-        # Map architecture: offset, multiplier
-        header_size, entry_size = {
-            'i386':   (0x10, 0x10),
-            'amd64': (0x10, 0x10),
-            'arm':   (0x14, 0xC),
-            'aarch64': (0x20, 0x20),
-        }.get(self.arch, (0,0))
+                res = emulate_plt_instructions(self,
+                                                dt_pltgot,
+                                                section.header.sh_addr,
+                                                section.data(),
+                                                inv_symbols)
 
-        address = plt.header.sh_addr + header_size
+                for address, target in reversed(sorted(res.items())):
+                    self.plt[inv_symbols[target]] = address
 
-        # Based on the ordering of the GOT symbols, populate the PLT
-        for i,(addr,name) in enumerate(sorted((addr,name) for name, addr in self.got.items())):
-            self.plt[name] = address
+        for a,n in sorted({v:k for k,v in self.plt.items()}.items()):
+            log.debug('PLT %#x %s', a, n)
 
-            # Some PLT entries in ARM binaries have a thumb-mode stub that looks like:
-            #
-            # 00008304 <__gmon_start__@plt>:
-            #     8304:   4778        bx  pc
-            #     8306:   46c0        nop         ; (mov r8, r8)
-            #     8308:   e28fc600    add ip, pc, #0, 12
-            #     830c:   e28cca08    add ip, ip, #8, 20  ; 0x8000
-            #     8310:   e5bcf228    ldr pc, [ip, #552]! ; 0x228
-            if self.arch in ('arm', 'thumb') and self.u16(address) == 0x4778:
-                address += 4
+    def _populate_kernel_version(self):
+        if 'linux_banner' not in self.symbols:
+            return
 
-            address += entry_size
+        banner = self.string(self.symbols.linux_banner)
+
+        # 'Linux version 3.18.31-gd0846ecc
+        regex = r'Linux version (\S+)'
+        match = re.search(regex, banner)
+
+        if match:
+            version = match.group(1)
+
+            if '-' in version:
+                version, self.build = version.split('-', 1)
+
+            self.version = list(map(int, version.split('.')))
+
+        self.config['version'] = self.version
 
     def search(self, needle, writable = False):
-        """search(needle, writable = False) -> str generator
+        """search(needle, writable = False) -> generator
 
         Search the ELF's virtual address space for the specified string.
+
+        Notes:
+            Does not search empty space between segments, or uninitialized
+            data.  This will only return data that actually exists in the
+            ELF file.  Searching for a long string of NULL bytes probably
+            won't work.
 
         Arguments:
             needle(str): String to search for.
             writable(bool): Search only writable sections.
 
-        Returns:
+        Yields:
             An iterator for each virtual address that matches.
 
         Examples:
-            >>> bash = ELF(which('bash'))
+
+            An ELF header starts with the bytes ``\\x7fELF``, so we
+            sould be able to find it easily.
+
+            >>> bash = ELF('/bin/bash')
             >>> bash.address + 1 == next(bash.search('ELF'))
             True
 
-            >>> sh = ELF(which('bash'))
-            >>> # /bin/sh should only depend on libc
-            >>> libc_path = [key for key in sh.libs.keys() if 'libc' in key][0]
-            >>> libc = ELF(libc_path)
-            >>> # this string should be in there because of system(3)
-            >>> len(list(libc.search('/bin/sh'))) > 0
+            We can also search for string the binary.
+
+            >>> len(list(bash.search('GNU bash'))) > 0
             True
         """
         load_address_fixup = (self.address - self.load_addr)
@@ -505,7 +889,11 @@ class ELF(ELFFile):
 
         for seg in segments:
             addr   = seg.header.p_vaddr
-            data   = seg.data()
+            memsz  = seg.header.p_memsz
+            zeroed = memsz - seg.header.p_filesz
+            offset = seg.header.p_offset
+            data   = self.mmap[offset:offset+memsz]
+            data   += '\x00' * zeroed
             offset = 0
             while True:
                 offset = data.find(needle, offset)
@@ -515,16 +903,24 @@ class ELF(ELFFile):
                 offset += 1
 
     def offset_to_vaddr(self, offset):
-        """Translates the specified offset to a virtual address.
+        """offset_to_vaddr(offset) -> int
+
+        Translates the specified offset to a virtual address.
 
         Arguments:
             offset(int): Offset to translate
 
         Returns:
-            Virtual address which corresponds to the file offset, or None
+            `int`: Virtual address which corresponds to the file offset, or
+            :const:`None`.
 
         Examples:
-            >>> bash = ELF(which('bash'))
+
+            This example shows that regardless of changes to the virtual
+            address layout by modifying :attr:`.ELF.address`, the offset
+            for any given address doesn't change.
+
+            >>> bash = ELF('/bin/bash')
             >>> bash.address == bash.offset_to_vaddr(0)
             True
             >>> bash.address += 0x123456
@@ -542,63 +938,191 @@ class ELF(ELFFile):
                 return segment.header.p_vaddr + delta + load_address_fixup
         return None
 
+    def _populate_memory(self):
+        load_segments = filter(lambda s: s.header.p_type == 'PT_LOAD', self.iter_segments())
+
+        # Map all of the segments
+        for i, segment in enumerate(load_segments):
+            start = segment.header.p_vaddr
+            stop_data = start + segment.header.p_filesz
+            stop_mem  = start + segment.header.p_memsz
+
+            # Chop any existing segments which cover the range described by
+            # [vaddr, vaddr+filesz].
+            #
+            # This has the effect of removing any issues we may encounter
+            # with "overlapping" segments, by giving precedence to whichever
+            # DT_LOAD segment is **last** to load data into the region.
+            self.memory.chop(start, stop_data)
+
+            # Add the new segment
+            if start != stop_data:
+                self.memory.addi(start, stop_data, segment)
+
+            if stop_data != stop_mem:
+                self.memory.addi(stop_data, stop_mem, '\x00')
+
+            # Check for holes which we can fill
+            if self._fill_gaps and i+1 < len(load_segments):
+                next_start = load_segments[i+1].header.p_vaddr
+                if stop_mem < next_start:
+                    self.memory.addi(stop_mem, next_start, None)
+            else:
+                page_end = (stop_mem + 0xfff) & ~(0xfff)
+
+                if stop_mem < page_end:
+                    self.memory.addi(stop_mem, page_end, None)
 
     def vaddr_to_offset(self, address):
-        """Translates the specified virtual address to a file address
+        """vaddr_to_offset(address) -> int
+
+        Translates the specified virtual address to a file offset
 
         Arguments:
             address(int): Virtual address to translate
 
         Returns:
-            Offset within the ELF file which corresponds to the address,
-            or None.
+            int: Offset within the ELF file which corresponds to the address,
+            or :const:`None`.
 
         Examples:
             >>> bash = ELF(which('bash'))
-            >>> 0 == bash.vaddr_to_offset(bash.address)
-            True
+            >>> bash.vaddr_to_offset(bash.address)
+            0
             >>> bash.address += 0x123456
-            >>> 0 == bash.vaddr_to_offset(bash.address)
+            >>> bash.vaddr_to_offset(bash.address)
+            0
+            >>> bash.vaddr_to_offset(0) is None
             True
         """
-        load_address = address - self.address + self.load_addr
 
-        for segment in self.segments:
-            begin = segment.header.p_vaddr
-            size  = segment.header.p_memsz
-            end   = begin + size
-            if begin <= load_address and load_address <= end:
-                delta = load_address - begin
-                return segment.header.p_offset + delta
+        for interval in self.memory[address]:
+            segment = interval.data
 
-        log.warning("Address %#x does not exist in %s" % (address, self.file.name))
-        return None
+            # Convert the address back to how it was when the segment was loaded
+            address = (address - self.address) + self.load_addr
+
+            # Figure out the offset into the segment
+            offset = address - segment.header.p_vaddr
+
+            # Add the segment-base offset to the offset-within-the-segment
+            return segment.header.p_offset + offset
 
     def read(self, address, count):
-        """Read data from the specified virtual address
+        r"""read(address, count) -> bytes
+
+        Read data from the specified virtual address
 
         Arguments:
             address(int): Virtual address to read
             count(int): Number of bytes to read
 
         Returns:
-            A string of bytes, or None
+            A :class:`str` object, or :const:`None`.
 
         Examples:
-          >>> bash = ELF(which('bash'))
-          >>> bash.read(bash.address+1, 3)
-          'ELF'
+            The simplest example is just to read the ELF header.
+
+            >>> bash = ELF(which('bash'))
+            >>> bash.read(bash.address, 4)
+            '\x7fELF'
+
+            ELF segments do not have to contain all of the data on-disk
+            that gets loaded into memory.
+
+            First, let's create an ELF file has some code in two sections.
+
+            >>> assembly = '''
+            ... .section .A,"awx"
+            ... .global A
+            ... A: nop
+            ... .section .B,"awx"
+            ... .global B
+            ... B: int3
+            ... '''
+            >>> e = ELF.from_assembly(assembly, vma=False)
+
+            By default, these come right after eachother in memory.
+
+            >>> e.read(e.symbols.A, 2)
+            '\x90\xcc'
+            >>> e.symbols.B - e.symbols.A
+            1
+
+            Let's move the sections so that B is a little bit further away.
+
+            >>> objcopy = pwnlib.asm._objcopy()
+            >>> objcopy += [
+            ...     '--change-section-vma', '.B+5',
+            ...     '--change-section-lma', '.B+5',
+            ...     e.path
+            ... ]
+            >>> subprocess.check_call(objcopy)
+            0
+
+            Now let's re-load the ELF, and check again
+
+            >>> e = ELF(e.path)
+            >>> e.symbols.B - e.symbols.A
+            6
+            >>> e.read(e.symbols.A, 2)
+            '\x90\x00'
+            >>> e.read(e.symbols.A, 7)
+            '\x90\x00\x00\x00\x00\x00\xcc'
+            >>> e.read(e.symbols.A, 10)
+            '\x90\x00\x00\x00\x00\x00\xcc\x00\x00\x00'
+
+            Everything is relative to the user-selected base address, so moving
+            things around keeps everything working.
+
+            >>> e.address += 0x1000
+            >>> e.read(e.symbols.A, 10)
+            '\x90\x00\x00\x00\x00\x00\xcc\x00\x00\x00'
         """
-        offset = self.vaddr_to_offset(address)
+        retval = []
 
-        if offset is not None:
-            old = self.stream.tell()
-            self.stream.seek(offset)
-            data = self.stream.read(count)
-            self.stream.seek(old)
-            return data
+        if count == 0:
+            return ''
 
-        return ''
+        start = address
+        stop = address + count
+
+        overlap = self.memory.search(start, stop)
+
+        # Create a new view of memory, for just what we need
+        memory = intervaltree.IntervalTree(overlap)
+        memory.chop(None, start)
+        memory.chop(stop, None)
+
+        if memory.begin() != start:
+            log.error("Address %#x is not contained in %s" % (start, self))
+
+        if memory.end() != stop:
+            log.error("Address %#x is not contained in %s" % (stop, self))
+
+        # We have a view of memory which lets us get everything we need
+        for begin, end, data in sorted(memory):
+            length = end-begin
+
+            if data in (None, '\x00'):
+                retval.append('\x00' * length)
+                continue
+
+            # Offset within VMA range
+            begin -= self.address
+
+            # Adjust to original VMA range
+            begin += self.load_addr
+
+            # Adjust to offset within segment VMA
+            offset = begin - data.header.p_vaddr
+
+            # Adjust in-segment offset to in-file offset
+            offset += data.header.p_offset
+
+            retval.append(self.mmap[offset:offset+length])
+
+        return ''.join(retval)
 
     def write(self, address, data):
         """Writes data to the specified virtual address
@@ -607,7 +1131,7 @@ class ELF(ELFFile):
             address(int): Virtual address to write
             data(str): Bytes to write
 
-        Note::
+        Note:
             This routine does not check the bounds on the write to ensure
             that it stays in the same segment.
 
@@ -622,14 +1146,12 @@ class ELF(ELFFile):
         offset = self.vaddr_to_offset(address)
 
         if offset is not None:
-            old = self.stream.tell()
-            self.stream.seek(offset)
-            self.stream.write(data)
-            self.stream.seek(old)
+            length = len(data)
+            self.mmap[offset:offset+length] = data
 
         return None
 
-    def save(self, path):
+    def save(self, path=None):
         """Save the ELF to a file
 
         >>> bash = ELF(which('bash'))
@@ -639,60 +1161,77 @@ class ELF(ELFFile):
         >>> bash.read() == copy.read()
         True
         """
-        old = self.stream.tell()
-
-        with open(path,'wb+') as fd:
-            self.stream.seek(0)
-            fd.write(self.get_data())
-
-        self.stream.seek(old)
+        if path is None:
+            path = self.path
+        misc.write(path, self.data)
 
     def get_data(self):
-        """Retrieve the raw data from the ELF file.
+        """get_data() -> bytes
+
+        Retrieve the raw data from the ELF file.
 
         >>> bash = ELF(which('bash'))
         >>> fd   = open(which('bash'))
         >>> bash.get_data() == fd.read()
         True
         """
-        old = self.stream.tell()
-        self.stream.seek(0)
-        data = self.stream.read(self.stream.size())
-        self.stream.seek(old)
-        return data
+        return self.mmap[:]
 
     @property
     def data(self):
-        return self.get_data()
+        """:class:`str`: Raw data of the ELF file.
+
+        See:
+            :meth:`get_data`
+        """
+        return self.mmap[:]
 
     def disasm(self, address, n_bytes):
-        """Returns a string of disassembled instructions at
+        """disasm(address, n_bytes) -> str
+
+        Returns a string of disassembled instructions at
         the specified virtual memory address"""
         arch = self.arch
         if self.arch == 'arm' and address & 1:
             arch = 'thumb'
             address -= 1
-        return disasm(self.read(address, n_bytes), vma=address, arch=arch)
+
+        return disasm(self.read(address, n_bytes), vma=address, arch=arch, endian=self.endian)
 
     def asm(self, address, assembly):
-        """Assembles the specified instructions and inserts them
+        """asm(address, assembly)
+
+        Assembles the specified instructions and inserts them
         into the ELF at the specified address.
 
-        The resulting binary can be saved with ELF.save()
+        This modifies the ELF in-pace.
+        The resulting binary can be saved with :meth:`.ELF.save`
         """
         binary = asm(assembly, vma=address)
         self.write(address, binary)
 
     def bss(self, offset=0):
-        """Returns an index into the .bss segment"""
+        """bss(offset=0) -> int
+
+        Returns:
+            Address of the ``.bss`` section, plus the specified offset.
+        """
         orig_bss = self.get_section_by_name('.bss').header.sh_addr
         curr_bss = orig_bss - self.load_addr + self.address
         return curr_bss + offset
 
     def __repr__(self):
-        return "ELF(%r)" % self.path
+        return "%s(%r)" % (self.__class__.__name__, self.path)
 
     def dynamic_by_tag(self, tag):
+        """dynamic_by_tag(tag) -> tag
+
+        Arguments:
+            tag(str): Named ``DT_XXX`` tag (e.g. ``'DT_STRTAB'``).
+
+        Returns:
+            :class:`elftools.elf.dynamic.DynamicTag`
+        """
         dt      = None
         dynamic = self.get_section_by_name('.dynamic')
 
@@ -706,7 +1245,29 @@ class ELF(ELFFile):
 
         return dt
 
+    def dynamic_value_by_tag(self, tag):
+        """dynamic_value_by_tag(tag) -> int
+
+        Retrieve the value from a dynamic tag a la ``DT_XXX``.
+
+        If the tag is missing, returns ``None``.
+        """
+        tag = self.dynamic_by_tag(tag)
+
+        if tag:
+            return tag.entry.d_val
+
     def dynamic_string(self, offset):
+        """dynamic_string(offset) -> bytes
+
+        Fetches an enumerated string from the ``DT_STRTAB`` table.
+
+        Arguments:
+            offset(int): String index
+
+        Returns:
+            :class:`str`: String from the table as raw bytes.
+        """
         dt_strtab = self.dynamic_by_tag('DT_STRTAB')
 
         if not dt_strtab:
@@ -720,43 +1281,183 @@ class ELF(ELFFile):
         return string.rstrip('\x00')
 
 
+
     @property
     def relro(self):
+        """:class:`bool`: Whether the current binary uses RELRO protections.
+
+        This requires both presence of the dynamic tag ``DT_BIND_NOW``, and
+        a ``GNU_RELRO`` program header.
+
+        The `ELF Specification`_ describes how the linker should resolve
+        symbols immediately, as soon as a binary is loaded.  This can be
+        emulated with the ``LD_BIND_NOW=1`` environment variable.
+
+            ``DT_BIND_NOW``
+
+            If present in a shared object or executable, this entry instructs
+            the dynamic linker to process all relocations for the object
+            containing this entry before transferring control to the program.
+            The presence of this entry takes precedence over a directive to use
+            lazy binding for this object when specified through the environment
+            or via ``dlopen(BA_LIB)``.
+
+            (`page 81`_)
+
+        Separately, an extension to the GNU linker allows a binary to specify
+        a PT_GNU_RELRO_ program header, which describes the *region of memory
+        which is to be made read-only after relocations are complete.*
+
+        Finally, a new-ish extension which doesn't seem to have a canonical
+        source of documentation is DF_BIND_NOW_, which has supposedly superceded
+        ``DT_BIND_NOW``.
+
+            ``DF_BIND_NOW``
+
+            If set in a shared object or executable, this flag instructs the
+            dynamic linker to process all relocations for the object containing
+            this entry before transferring control to the program. The presence
+            of this entry takes precedence over a directive to use lazy binding
+            for this object when specified through the environment or via
+            ``dlopen(BA_LIB)``.
+
+        .. _ELF Specification: https://refspecs.linuxbase.org/elf/elf.pdf
+        .. _page 81: https://refspecs.linuxbase.org/elf/elf.pdf#page=81
+        .. _DT_BIND_NOW: https://refspecs.linuxbase.org/elf/elf.pdf#page=81
+        .. _PT_GNU_RELRO: https://refspecs.linuxbase.org/LSB_3.1.1/LSB-Core-generic/LSB-Core-generic.html#PROGHEADER
+        .. _DF_BIND_NOW: http://refspecs.linuxbase.org/elf/gabi4+/ch5.dynamic.html#df_bind_now
+
+        """
         if self.dynamic_by_tag('DT_BIND_NOW'):
             return "Full"
 
         if any('GNU_RELRO' in str(s.header.p_type) for s in self.segments):
             return "Partial"
+
         return None
 
     @property
     def nx(self):
-        if not any('GNU_STACK' in str(seg.header.p_type) for seg in self.segments):
-            return False
+        """:class:`bool`: Whether the current binary uses NX protections.
 
-        # Can't call self.executable_segments because of dependency loop.
-        exec_seg = [s for s in self.segments if s.header.p_flags & P_FLAGS.PF_X]
-        return not any('GNU_STACK' in str(seg.header.p_type) for seg in exec_seg)
+        Specifically, we are checking for ``READ_IMPLIES_EXEC`` being set
+        by the kernel, as a result of honoring ``PT_GNU_STACK`` in the kernel.
+
+        The **Linux kernel** directly honors ``PT_GNU_STACK`` to `mark the
+        stack as executable.`__
+
+        .. __: https://github.com/torvalds/linux/blob/v4.9/fs/binfmt_elf.c#L784-L789
+
+        .. code-block:: c
+
+            case PT_GNU_STACK:
+                if (elf_ppnt->p_flags & PF_X)
+                    executable_stack = EXSTACK_ENABLE_X;
+                else
+                    executable_stack = EXSTACK_DISABLE_X;
+                break;
+
+        Additionally, it then sets ``read_implies_exec``, so that `all readable pages
+        are executable`__.
+
+        .. __: https://github.com/torvalds/linux/blob/v4.9/fs/binfmt_elf.c#L849-L850
+
+        .. code-block:: c
+
+            if (elf_read_implies_exec(loc->elf_ex, executable_stack))
+                current->personality |= READ_IMPLIES_EXEC;
+        """
+        if not self.executable:
+            return True
+
+        for seg in self.iter_segments_by_type('GNU_STACK'):
+            return not bool(seg.header.p_flags & P_FLAGS.PF_X)
+
+        # If you NULL out the PT_GNU_STACK section via ELF.disable_nx(),
+        # everything is executable.
+        return False
 
     @property
     def execstack(self):
-        return not self.nx
+        """:class:`bool`: Whether the current binary uses an executable stack.
+
+        This is based on the presence of a program header PT_GNU_STACK_
+        being present, and its setting.
+
+            ``PT_GNU_STACK``
+
+            The p_flags member specifies the permissions on the segment
+            containing the stack and is used to indicate wether the stack
+            should be executable. The absense of this header indicates
+            that the stack will be executable.
+
+        In particular, if the header is missing the stack is executable.
+        If the header is present, it may **explicitly** mark that the stack is
+        executable.
+
+        This is only somewhat accurate.  When using the GNU Linker, it usees
+        DEFAULT_STACK_PERMS_ to decide whether a lack of ``PT_GNU_STACK``
+        should mark the stack as executable:
+
+        .. code-block:: c
+
+            /* On most platforms presume that PT_GNU_STACK is absent and the stack is
+             * executable.  Other platforms default to a nonexecutable stack and don't
+             * need PT_GNU_STACK to do so.  */
+            uint_fast16_t stack_flags = DEFAULT_STACK_PERMS;
+
+        By searching the source for ``DEFAULT_STACK_PERMS``, we can see which
+        architectures have which settings.
+
+        ::
+
+            $ git grep '#define DEFAULT_STACK_PERMS' | grep -v PF_X
+            sysdeps/aarch64/stackinfo.h:31:#define DEFAULT_STACK_PERMS (PF_R|PF_W)
+            sysdeps/nios2/stackinfo.h:31:#define DEFAULT_STACK_PERMS (PF_R|PF_W)
+            sysdeps/tile/stackinfo.h:31:#define DEFAULT_STACK_PERMS (PF_R|PF_W)
+
+        .. _PT_GNU_STACK: https://refspecs.linuxbase.org/LSB_3.0.0/LSB-PDA/LSB-PDA/progheader.html
+        .. _DEFAULT_STACK_PERMS: https://github.com/bminor/glibc/blob/glibc-2.25/elf/dl-load.c#L1036-L1038
+        """
+        # Dynamic objects do not have the ability to change the executable state of the stack.
+        if not self.executable:
+            return False
+
+        # If NX is completely off for the process, the stack is executable.
+        if not self.nx:
+            return True
+
+        # If the ``PT_GNU_STACK`` program header is missing, then use the
+        # default rules.  Only AArch64 gets a non-executable stack by default.
+        for _ in self.iter_segments_by_type('GNU_STACK'):
+            break
+        else:
+            return self.arch != 'aarch64'
+
+        return False
 
     @property
     def canary(self):
-        return '__stack_chk_fail' in self.symbols
+        """:class:`bool`: Whether the current binary uses stack canaries."""
+
+        # Sometimes there is no function for __stack_chk_fail,
+        # but there is an entry in the GOT
+        return '__stack_chk_fail' in (set(self.symbols) | set(self.got))
 
     @property
     def packed(self):
+        """:class:`bool`: Whether the current binary is packed with UPX."""
         return 'UPX!' in self.get_data()
 
     @property
     def pie(self):
+        """:class:`bool`: Whether the current binary is position-independent."""
         return self.elftype == 'DYN'
     aslr=pie
 
     @property
     def rpath(self):
+        """:class:`bool`: Whether the current binary has an ``RPATH``."""
         dt_rpath = self.dynamic_by_tag('DT_RPATH')
 
         if not dt_rpath:
@@ -766,6 +1467,7 @@ class ELF(ELFFile):
 
     @property
     def runpath(self):
+        """:class:`bool`: Whether the current binary has a ``RUNPATH``."""
         dt_runpath = self.dynamic_by_tag('DT_RUNPATH')
 
         if not dt_runpath:
@@ -774,11 +1476,26 @@ class ELF(ELFFile):
         return self.dynamic_string(dt_rpath.entry.d_ptr)
 
     def checksec(self, banner=True):
+        """checksec(banner=True)
+
+        Prints out information in the binary, similar to ``checksec.sh``.
+
+        Arguments:
+            banner(bool): Whether to print the path to the ELF binary.
+        """
         red    = text.red
         green  = text.green
         yellow = text.yellow
 
-        res = [
+        res = []
+
+        # Kernel version?
+        if self.version and self.version != (0,):
+            res.append('Version:'.ljust(10) + '.'.join(map(str, self.version)))
+        if self.build:
+            res.append('Build:'.ljust(10) + self.build)
+
+        res.extend([
             "RELRO:".ljust(10) + {
                 'Full':    green("Full RELRO"),
                 'Partial': yellow("Partial RELRO"),
@@ -794,17 +1511,19 @@ class ELF(ELFFile):
             }[self.nx],
             "PIE:".ljust(10) + {
                 True: green("PIE enabled"),
-                False: red("No PIE")
-            }[self.pie]
-        ]
+                False: red("No PIE (%#x)" % self.address)
+            }[self.pie],
+        ])
+
+        # Execstack may be a thing, even with NX enabled, because of glibc
+        if self.execstack and self.nx:
+            res.append("Stack:".ljust(10) + red("Executable"))
 
         # Are there any RWX areas in the binary?
         #
         # This will occur if NX is disabled and *any* area is
         # RW, or can expressly occur.
-        rwx = self.rwx_segments
-
-        if self.nx and rwx:
+        if self.rwx_segments or (not self.nx and self.writable_segments):
             res += [ "RWX:".ljust(10) + red("Has RWX segments") ]
 
         if self.rpath:
@@ -828,10 +1547,32 @@ class ELF(ELFFile):
         if self.ubsan:
             res.append("UBSAN:".ljust(10) + green("Enabled"))
 
+        # Check for Linux configuration, it must contain more than
+        # just the version.
+        if len(self.config) > 1:
+            config_opts = collections.defaultdict(lambda: [])
+            for checker in kernel_configuration:
+                result, message = checker(self.config)
+
+                if not result:
+                    config_opts[checker.title].append((checker.name, message))
+
+
+            for title, values in config_opts.items():
+                res.append(title + ':')
+                for name, message in sorted(values):
+                    line = '{} = {}'.format(name, red(str(self.config.get(name, None))))
+                    if message:
+                        line += ' ({})'.format(message)
+                    res.append('    ' + line)
+
+            # res.extend(sorted(config_opts))
+
         return '\n'.join(res)
 
     @property
     def buildid(self):
+        """:class:`str`: GNU Build ID embedded into the binary"""
         section = self.get_section_by_name('.note.gnu.build-id')
         if section:
             return section.data()[16:]
@@ -839,36 +1580,87 @@ class ELF(ELFFile):
 
     @property
     def fortify(self):
+        """:class:`bool`: Whether the current binary was built with
+        Fortify Source (``-DFORTIFY``)."""
         if any(s.endswith('_chk') for s in self.plt):
             return True
         return False
 
     @property
     def asan(self):
+        """:class:`bool`: Whether the current binary was built with
+        Address Sanitizer (``ASAN``)."""
         return any(s.startswith('__asan_') for s in self.symbols)
 
     @property
     def msan(self):
+        """:class:`bool`: Whether the current binary was built with
+        Memory Sanitizer (``MSAN``)."""
         return any(s.startswith('__msan_') for s in self.symbols)
 
     @property
     def ubsan(self):
+        """:class:`bool`: Whether the current binary was built with
+        Undefined Behavior Sanitizer (``UBSAN``)."""
         return any(s.startswith('__ubsan_') for s in self.symbols)
 
+    def _update_args(self, kw):
+        kw.setdefault('arch', self.arch)
+        kw.setdefault('bits', self.bits)
+        kw.setdefault('endian', self.endian)
 
+    def p64(self,  address, data, *a, **kw):
+        """Writes a 64-bit integer ``data`` to the specified ``address``"""
+        self._update_args(kw)
+        return self.write(address, packing.p64(data, *a, **kw))
 
-    def p64(self,  address, data, *a, **kw):    return self.write(address, packing.p64(data, *a, **kw))
-    def p32(self,  address, data, *a, **kw):    return self.write(address, packing.p32(data, *a, **kw))
-    def p16(self,  address, data, *a, **kw):    return self.write(address, packing.p16(data, *a, **kw))
-    def p8(self,   address, data, *a, **kw):    return self.write(address, packing.p8(data, *a, **kw))
-    def pack(self, address, data, *a, **kw):    return self.write(address, packing.pack(data, *a, **kw))
+    def p32(self,  address, data, *a, **kw):
+        """Writes a 32-bit integer ``data`` to the specified ``address``"""
+        self._update_args(kw)
+        return self.write(address, packing.p32(data, *a, **kw))
 
-    def u64(self,    address, *a, **kw):        return packing.u64(self.read(address, 8), *a, **kw)
-    def u32(self,    address, *a, **kw):        return packing.u32(self.read(address, 4), *a, **kw)
-    def u16(self,    address, *a, **kw):        return packing.u16(self.read(address, 2), *a, **kw)
-    def u8(self,     address, *a, **kw):        return packing.u8(self.read(address, 1), *a, **kw)
-    def unpack(self, address, *a, **kw):        return packing.unpack(self.read(address, context.bytes), *a, **kw)
+    def p16(self,  address, data, *a, **kw):
+        """Writes a 16-bit integer ``data`` to the specified ``address``"""
+        self._update_args(kw)
+        return self.write(address, packing.p16(data, *a, **kw))
+
+    def p8(self,   address, data, *a, **kw):
+        """Writes a 8-bit integer ``data`` to the specified ``address``"""
+        self._update_args(kw)
+        return self.write(address, packing.p8(data, *a, **kw))
+
+    def pack(self, address, data, *a, **kw):
+        """Writes a packed integer ``data`` to the specified ``address``"""
+        self._update_args(kw)
+        return self.write(address, packing.pack(data, *a, **kw))
+
+    def u64(self,    address, *a, **kw):
+        """Unpacks an integer from the specified ``address``."""
+        self._update_args(kw)
+        return packing.u64(self.read(address, 8), *a, **kw)
+
+    def u32(self,    address, *a, **kw):
+        """Unpacks an integer from the specified ``address``."""
+        self._update_args(kw)
+        return packing.u32(self.read(address, 4), *a, **kw)
+
+    def u16(self,    address, *a, **kw):
+        """Unpacks an integer from the specified ``address``."""
+        self._update_args(kw)
+        return packing.u16(self.read(address, 2), *a, **kw)
+
+    def u8(self,     address, *a, **kw):
+        """Unpacks an integer from the specified ``address``."""
+        self._update_args(kw)
+        return packing.u8(self.read(address, 1), *a, **kw)
+
+    def unpack(self, address, *a, **kw):
+        """Unpacks an integer from the specified ``address``."""
+        self._update_args(kw)
+        return packing.unpack(self.read(address, context.bytes), *a, **kw)
+
     def string(self, address):
+        """Reads a null-terminated string from the specified ``address``"""
         data = ''
         while True:
             c = self.read(address, 1)
@@ -879,4 +1671,47 @@ class ELF(ELFFile):
             data += c
             address += 1
 
-    def flat(self, *a, **kw):       return self.send(packing.flat(*a,**kw))
+    def flat(self, address, *a, **kw):
+        """Writes a full array of values to the specified address.
+
+        See: :func:`.packing.flat`
+        """
+        return self.write(address, packing.flat(*a,**kw))
+
+    def fit(self, address, *a, **kw):
+        """Writes fitted data into the specified address.
+
+        See: :func:`.packing.fit`
+        """
+        return self.write(address, packing.fit(*a, **kw))
+
+    def parse_kconfig(self, data):
+        self.config.update(parse_kconfig(data))
+
+    def disable_nx(self):
+        """Disables NX for the ELF.
+
+        Zeroes out the ``PT_GNU_STACK`` program header ``p_type`` field.
+        """
+        PT_GNU_STACK = packing.p32(ENUM_P_TYPE['PT_GNU_STACK'])
+
+        if not self.executable:
+            log.error("Can only make stack executable with executables")
+
+        for i, segment in enumerate(self.iter_segments()):
+            if not segment.header.p_type:
+                continue
+            if 'GNU_STACK' not in segment.header.p_type:
+                continue
+
+            phoff = self.header.e_phoff
+            phentsize = self.header.e_phentsize
+            offset = phoff + phentsize * i
+
+            if self.mmap[offset:offset+4] == PT_GNU_STACK:
+                self.mmap[offset:offset+4] = '\x00' * 4
+                self.save()
+                return
+
+        log.error("Could not find PT_GNU_STACK, stack should already be executable")
+

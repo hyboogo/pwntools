@@ -1,10 +1,11 @@
 #!/usr/bin/env python2
+from __future__ import absolute_import
+
 import argparse
 import sys
 
 from pwn import *
-
-from . import common
+from pwnlib.commandline import common
 
 parser = common.parser_commands.add_parser(
     'asm',
@@ -95,6 +96,10 @@ parser.add_argument(
 def main(args):
     tty    = args.output.isatty()
 
+    if args.infile.isatty() and not args.lines:
+        parser.print_usage()
+        sys.exit(1)
+
     data   = '\n'.join(args.lines) or args.infile.read()
     output = asm(data.replace(';', '\n'))
     fmt    = args.format or ('hex' if tty else 'raw')
@@ -124,4 +129,4 @@ def main(args):
         args.output.write('\n')
 
 if __name__ == '__main__':
-    pwnlib.common.main(__file__)
+    pwnlib.commandline.common.main(__file__)

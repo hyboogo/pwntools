@@ -4,12 +4,15 @@
 Implements context management so that nested/scoped contexts and threaded
 contexts work properly and as expected.
 """
+from __future__ import absolute_import
+
 import collections
 import functools
 import logging
 import os
 import platform
 import socket
+import stat
 import string
 import subprocess
 import sys
@@ -18,8 +21,11 @@ import time
 
 import socks
 
-from ..device import Device
-from ..timeout import Timeout
+from pwnlib.config import register_config
+from pwnlib.device import Device
+from pwnlib.timeout import Timeout
+
+__all__ = ['context', 'ContextType', 'Thread']
 
 _original_socket = socket.socket
 
@@ -243,9 +249,10 @@ def _longest(d):
     as it ensures the most complete match will be found.
 
     >>> data = {'a': 1, 'bb': 2, 'ccc': 3}
-    >>> _longest(data) == data
+    >>> pwnlib.context._longest(data) == data
     True
-    >>> for i in _longest(data): print i
+    >>> for i in pwnlib.context._longest(data):
+    ...     print i
     ccc
     bb
     a
@@ -260,7 +267,7 @@ class ContextType(object):
     r"""
     Class for specifying information about the target machine.
     Intended for use as a pseudo-singleton through the global
-    variable ``pwnlib.context.context``, available via
+    variable :data:`.context`, available via
     ``from pwn import *`` as ``context``.
 
     The context is usually specified at the top of the Python file for clarity. ::
@@ -329,6 +336,8 @@ class ContextType(object):
         'aslr': True,
         'binary': None,
         'bits': 32,
+        'buffer_size': 4096,
+        'delete_corefiles': False,
         'device': os.getenv('ANDROID_SERIAL', None) or None,
         'endian': 'little',
         'kernel': None,
@@ -336,12 +345,13 @@ class ContextType(object):
         'log_file': _devnull(),
         'log_console': sys.stdout,
         'randomize': False,
+        'rename_corefiles': True,
         'newline': '\n',
         'noptrace': False,
         'os': 'linux',
         'proxy': None,
         'signed': False,
-        'terminal': None,
+        'terminal': tuple(),
         'timeout': Timeout.maximum,
     }
 
@@ -526,12 +536,13 @@ class ContextType(object):
     def quiet(self, function=None):
         """Disables all non-error logging within the enclosed scope,
         *unless* the debugging level is set to 'debug' or lower."""
-        if not function:
-            level = 'error'
-            if context.log_level <= logging.DEBUG:
-                level = None
-            return self.local(function, log_level=level)
+        level = 'error'
+        if context.log_level <= logging.DEBUG:
+            level = None
+        return self.local(function, log_level=level)
 
+    def quietfunc(self, function):
+        """Similar to :attr:`quiet`, but wraps a whole function."""
         @functools.wraps(function)
         def wrapper(*a, **kw):
             level = 'error'
@@ -561,6 +572,7 @@ class ContextType(object):
         Examples:
 
             >>> # Default value
+            >>> context.clear()
             >>> context.arch == 'i386'
             True
             >>> context.arch = 'arm'
@@ -687,7 +699,7 @@ class ContextType(object):
         """
         ASLR settings for new processes.
 
-        If ``False``, attempt to disable ASLR in all processes which are
+        If :const:`False`, attempt to disable ASLR in all processes which are
         created via ``personality`` (``setarch -R``) and ``setrlimit``
         (``ulimit -s unlimited``).
 
@@ -754,7 +766,7 @@ class ContextType(object):
 
         """
         # Cyclic imports... sorry Idolf.
-        from ..elf     import ELF
+        from pwnlib.elf     import ELF
 
         if not isinstance(binary, ELF):
             binary = ELF(binary)
@@ -983,7 +995,7 @@ class ContextType(object):
 
         Can be set to any non-string truthy value, or the specific string
         values ``'signed'`` or ``'unsigned'`` which are converted into
-        ``True`` and ``False`` correspondingly.
+        :const:`True` and :const:`False` correspondingly.
 
         Examples:
 
@@ -1119,15 +1131,20 @@ class ContextType(object):
             self.os = device.os or self.os
         elif isinstance(device, str):
             device = Device(device)
-        else:
+        elif device is not None:
             raise AttributeError("device must be either a Device object or a serial number as a string")
 
         return device
 
     @property
     def adb(self):
-        """Returns an argument array for connecting to adb."""
-        command = ['adb']
+        """Returns an argument array for connecting to adb.
+
+        Unless ``$ADB_PATH`` is set, uses the default ``adb`` binary in ``$PATH``.
+        """
+        ADB_PATH = os.environ.get('ADB_PATH', 'adb')
+
+        command = [ADB_PATH]
 
         if self.adb_host != self.defaults['adb_host']:
             command += ['-H', self.adb_host]
@@ -1140,6 +1157,79 @@ class ContextType(object):
 
         return command
 
+    @_validator
+    def buffer_size(self, size):
+        """Internal buffer size to use for :class:`pwnlib.tubes.tube.tube` objects.
+
+        This is not the maximum size of the buffer, but this is the amount of data
+        which is passed to each raw ``read`` syscall (or equivalent).
+        """
+        return int(size)
+
+    @property
+    def cache_dir(self):
+        """Directory used for caching data.
+
+        Note:
+            May be either a path string, or :const:`None`.
+
+        Example:
+
+            >>> cache_dir = context.cache_dir
+            >>> cache_dir is not None
+            True
+            >>> os.chmod(cache_dir, 0o000)
+            >>> context.cache_dir is None
+            True
+            >>> os.chmod(cache_dir, 0o755)
+            >>> cache_dir == context.cache_dir
+            True
+        """
+        home = os.path.expanduser('~')
+
+        if not os.access(home, os.W_OK):
+            return None
+
+        cache = os.path.join(home, '.pwntools-cache')
+
+        if not os.path.exists(cache):
+            try:
+                os.mkdir(cache)
+            except OSError:
+                return None
+
+        # Some wargames e.g. pwnable.kr have created dummy directories
+        # which cannot be modified by the user account (owned by root).
+        if not os.access(cache, os.W_OK):
+            return None
+
+        return cache
+
+    @_validator
+    def delete_corefiles(self, v):
+        """Whether pwntools automatically deletes corefiles after exiting.
+        This only affects corefiles accessed via :attr:`.process.corefile`.
+
+        Default value is ``False``.
+        """
+        return bool(v)
+
+    @_validator
+    def rename_corefiles(self, v):
+        """Whether pwntools automatically renames corefiles.
+
+        This is useful for two things:
+
+        - Prevent corefiles from being overwritten, if ``kernel.core_pattern``
+          is something simple like ``"core"``.
+        - Ensure corefiles are generated, if ``kernel.core_pattern`` uses ``apport``,
+          which refuses to overwrite any existing files.
+
+        This only affects corefiles accessed via :attr:`.process.corefile`.
+
+        Default value is ``True``.
+        """
+        return bool(v)
 
     #*************************************************************************
     #                               ALIASES
@@ -1215,11 +1305,14 @@ class ContextType(object):
     Thread = Thread
 
 
-#: Global ``context`` object, used to store commonly-used pwntools settings.
+#: Global :class:`.ContextType` object, used to store commonly-used pwntools settings.
+#:
 #: In most cases, the context is used to infer default variables values.
-#: For example, :meth:`pwnlib.asm.asm` can take an ``os`` parameter as a
-#: keyword argument.  If it is not supplied, the ``os`` specified by
-#: ``context`` is used instead.
+#: For example, :func:`.asm` can take an ``arch`` parameter as a
+#: keyword argument.
+#:
+#: If it is not supplied, the ``arch`` specified by ``context`` is used instead.
+#:
 #: Consider it a shorthand to passing ``os=`` and ``arch=`` to every single
 #: function call.
 context = ContextType()
@@ -1237,6 +1330,7 @@ def LocalContext(function):
 
     Example:
 
+        >>> context.clear()
         >>> @LocalContext
         ... def printArch():
         ...     print(context.arch)
@@ -1254,3 +1348,20 @@ def LocalContext(function):
         with context.local(**{k:kw.pop(k) for k,v in kw.items() if isinstance(getattr(ContextType, k, None), property)}):
             return function(*a, **kw)
     return setter
+
+# Read configuration options from the context section
+def update_context_defaults(section):
+    # Circular imports FTW!
+    from pwnlib.util import safeeval
+    from pwnlib.log import getLogger
+    log = getLogger(__name__)
+    for key, value in section.items():
+        if key not in ContextType.defaults:
+            log.warn("Unknown configuration option %r in section %r" % (key, 'context'))
+            continue
+        if isinstance(ContextType.defaults[key], (str, unicode, tuple)):
+            value = safeeval.expr(value)
+
+        ContextType.defaults[key] = value
+
+register_config('context', update_context_defaults)

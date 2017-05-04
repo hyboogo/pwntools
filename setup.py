@@ -3,6 +3,7 @@ import glob
 import os
 import platform
 import sys
+import traceback
 from distutils.command.install import INSTALL_SCHEMES
 from distutils.sysconfig import get_python_inc
 from distutils.util import convert_path
@@ -12,7 +13,7 @@ from setuptools import setup
 
 # Get all template files
 templates = []
-for dirpath, dirnames, filenames in os.walk(convert_path('pwnlib/shellcraft/templates')):
+for dirpath, dirnames, filenames in os.walk(convert_path('pwnlib/shellcraft/templates'), followlinks=True):
     for f in filenames:
         templates.append(os.path.relpath(os.path.join(dirpath, f), 'pwnlib'))
 
@@ -54,11 +55,10 @@ install_requires     = ['paramiko>=1.15.2',
                         'pysocks',
                         'python-dateutil',
                         'pypandoc',
-                        'packaging']
-
-# This is a hack until somebody ports psutil to OpenBSD
-if platform.system() != 'OpenBSD':
-    install_requires.append('psutil>=2.1.3')
+                        'packaging',
+                        'psutil>=3.3.0',
+                        'intervaltree',
+                        'unicorn']
 
 # Check that the user has installed the Python development headers
 PythonH = os.path.join(get_python_inc(), 'Python.h')
@@ -78,12 +78,15 @@ try:
     long_description = pypandoc.convert_file('README.md', 'rst')
 except ImportError:
     pass
+except Exception as e:
+    print >>sys.stderr, "Failed to convert README.md through pandoc, proceeding anyway"
+    traceback.print_exc()
 
 
 setup(
     name                 = 'pwntools',
     packages             = find_packages(),
-    version              = '3.3.0dev',
+    version              = '3.7.0dev',
     data_files           = [('',
                              glob.glob('*.md') + glob.glob('*.txt')),
                             ],
@@ -94,6 +97,7 @@ setup(
             'data/binutils/*',
             'data/includes/*.h',
             'data/includes/*/*.h',
+            'data/templates/pwnup.mako',
         ] + templates,
     },
     entry_points = {'console_scripts': console_scripts},

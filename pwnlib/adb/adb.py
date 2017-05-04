@@ -1,6 +1,7 @@
 """Provides utilities for interacting with Android devices via the Android Debug Bridge.
 
-# Using Android Devices with Pwntools
+Using Android Devices with Pwntools
+-----------------------------------
 
 Pwntools tries to be as easy as possible to use with Android devices.
 
@@ -10,14 +11,42 @@ If you have multiple devices, you have a handful of options to select one, or it
 over the devices.
 
 First and most important is the ``context.device`` property, which declares the "currently"
-seelcted device in any scope.  It can be set manually to a serial number, or to a ``Device``
+selected device in any scope.  It can be set manually to a serial number, or to a ``Device``
 instance.
 
 .. code-block:: python
 
-    >>> context.device = ''
+    # Take the first available device
+    context.device = adb.wait_for_device()
+
+    # Set a device by serial number
+    context.device = 'ZX1G22LH8S'
+
+    # Set a device by its product name
+    for device in adb.devices():
+        if device.product == 'shamu':
+            break
+    else:
+        error("Could not find any shamus!")
+
+Once a device is selected, you can operate on it with any of the functions in
+the :mod:`pwnlib.adb` module.
+
+.. code-block:: python
+
+    # Get a process listing
+    print adb.process(['ps']).recvall()
+
+    # Fetch properties
+    print adb.properties.ro.build.fingerprint
+
+    # Read and write files
+    print adb.read('/proc/version')
+    adb.write('/data/local/tmp/foo', 'my data')
 
 """
+from __future__ import absolute_import
+
 import functools
 import glob
 import logging
@@ -31,14 +60,14 @@ import time
 
 import dateutil.parser
 
-from .. import atexit
-from .. import tubes
-from ..context import LocalContext
-from ..context import context
-from ..device import Device
-from ..log import getLogger
-from ..util import misc
-from .protocol import Client
+from pwnlib import atexit
+from pwnlib import tubes
+from pwnlib.context import LocalContext
+from pwnlib.context import context
+from pwnlib.device import Device
+from pwnlib.log import getLogger
+from pwnlib.protocols.adb import AdbClient
+from pwnlib.util import misc
 
 log = getLogger(__name__)
 
@@ -59,10 +88,10 @@ def adb(argv, *a, **kw):
 
     return tubes.process.process(context.adb + argv, *a, **kw).recvall()
 
-@context.quiet
+@context.quietfunc
 def devices(serial=None):
     """Returns a list of ``Device`` objects corresponding to the connected devices."""
-    with Client() as c:
+    with AdbClient() as c:
         lines = c.devices(long=True)
     result = []
 
@@ -117,7 +146,7 @@ def root():
     log.info("Enabling root on %s" % context.device)
 
     with context.quiet:
-        with Client() as c:
+        with AdbClient() as c:
             reply = c.root()
 
     if 'already running as root' in reply:
@@ -146,7 +175,7 @@ def reboot(wait=True):
     """
     log.info('Rebooting device %s' % context.device)
 
-    with Client() as c:
+    with AdbClient() as c:
         c.reboot()
 
     if wait:
@@ -159,11 +188,49 @@ def reboot_bootloader():
     """
     log.info('Rebooting %s to bootloader' % context.device)
 
-    with Client() as c:
+    with AdbClient() as c:
         c.reboot_bootloader()
 
+@with_device
+def uptime():
+    """uptime() -> float
+
+    Returns:
+        Uptime of the device, in seconds
+    """
+    up, idle = map(float, read('/proc/uptime').split())
+    return up
+
+@with_device
+def boot_time():
+    """boot_time() -> int
+
+    Returns:
+        Boot time of the device, in Unix time, rounded to the
+        nearest second.
+    """
+    for line in read('/proc/stat').splitlines():
+        name, value = line.split(None, 1)
+        if name == 'btime':
+            return int(value)
+
 class AdbDevice(Device):
-    """Encapsulates information about a connected device."""
+    """Encapsulates information about a connected device.
+
+    Example:
+
+        >>> device = adb.wait_for_device()
+        >>> device.arch
+        'arm'
+        >>> device.bits
+        32
+        >>> device.os
+        'android'
+        >>> device.product
+        'sdk_phone_armv7'
+        >>> device.serial
+        'emulator-5554'
+    """
     def __init__(self, serial, type, port=None, product='unknown', model='unknown', device='unknown', features=None, **kw):
         self.serial  = serial
         self.type    = type
@@ -176,13 +243,45 @@ class AdbDevice(Device):
         if product == 'unknown':
             return
 
-        with context.local(device=serial):
+        # Deferred fields
+        self._initialized = False
+        self._arch = None
+        self._bits = None
+        self._endian = None
+        self._avd = None
+
+    @property
+    def arch(self):
+        self.__do_deferred_initialization()
+        return self._arch
+
+    @property
+    def avd(self):
+        self.__do_deferred_initialization()
+        return self._avd
+
+    @property
+    def bits(self):
+        self.__do_deferred_initialization()
+        return self._bits
+
+    @property
+    def endian(self):
+        self.__do_deferred_initialization()
+        return self._endian
+
+
+    def __do_deferred_initialization(self):
+        if self._initialized:
+            return
+
+        with context.local(device=self.serial):
             abi = str(properties.ro.product.cpu.abi)
             context.clear()
             context.arch = str(abi)
-            self.arch = context.arch
-            self.bits = context.bits
-            self.endian = context.endian
+            self._arch = context.arch
+            self._bits = context.bits
+            self._endian = context.endian
 
         if self.port == 'emulator':
             emulator, port = self.serial.split('-')
@@ -195,7 +294,8 @@ class AdbDevice(Device):
                     self.avd = r.recvline().strip()
             except:
                 pass
-            # r = remote('localhost')
+
+        self._initialized = True
 
     def __str__(self):
         return self.serial
@@ -246,7 +346,7 @@ class AdbDevice(Device):
         of this device.
 
         >>> property = 'ro.build.fingerprint'
-        >>> device = adb.current_device()
+        >>> device = adb.wait_for_device()
         >>> adb.getprop(property) == device.getprop(property)
         True
         """
@@ -279,7 +379,7 @@ def wait_for_device(kick=False):
         >>> device = adb.wait_for_device()
     """
     with log.waitfor("Waiting for device to come online") as w:
-        with Client() as c:
+        with AdbClient() as c:
             if kick:
                 try:
                     c.reconnect()
@@ -290,13 +390,15 @@ def wait_for_device(kick=False):
             if context.device:
                 serial = str(context.device)
 
-        with Client() as c:
+        with AdbClient() as c:
             c.wait_for_device(serial)
 
         for device in devices():
             if context.device == device:
                 return device
-            break
+
+            if not serial:
+                break
         else:
             log.error("Could not find any devices")
 
@@ -316,7 +418,7 @@ def disable_verity():
     with log.waitfor("Disabling dm-verity on %s" % context.device) as w:
         root()
 
-        with Client() as c:
+        with AdbClient() as c:
             reply = c.disable_verity()
 
         if 'Verity already disabled' in reply:
@@ -335,7 +437,7 @@ def remount():
         disable_verity()
         root()
 
-        with Client() as c:
+        with AdbClient() as c:
             reply = c.remount()
 
         if 'remount succeeded' not in reply:
@@ -346,7 +448,7 @@ def unroot():
     """Restarts adbd as AID_SHELL."""
     log.info("Unrooting %s" % context.device)
     with context.quiet:
-        with Client() as c:
+        with AdbClient() as c:
             reply  = c.unroot()
 
     if '0006closed' == reply:
@@ -409,10 +511,14 @@ def push(local_path, remote_path):
         local_path(str): Path to the local file to push.
         remote_path(str): Path or directory to store the file on the device.
 
+    Returns:
+        Remote path of the file.
+
     Example:
 
         >>> write('./filename', 'contents')
-        >>> _=adb.push('./filename', '/data/local/tmp')
+        >>> adb.push('./filename', '/data/local/tmp')
+        '/data/local/tmp/filename'
         >>> adb.read('/data/local/tmp/filename')
         'contents'
         >>> adb.push('./filename', '/does/not/exist')
@@ -427,7 +533,7 @@ def push(local_path, remote_path):
         msg += ' (%s)' % context.device
 
     with log.waitfor(msg) as w:
-        with Client() as c:
+        with AdbClient() as c:
 
             # We need to discover whether remote_path is a directory or not.
             # If we cannot stat the full path, assume it's a path-plus-filename,
@@ -447,10 +553,13 @@ def push(local_path, remote_path):
             if stat.S_ISDIR(mode):
                 remote_path = os.path.join(remote_path, remote_filename)
 
-            return c.write(remote_path,
-                           misc.read(local_path),
-                           callback=_create_adb_push_pull_callback(w))
-@context.quiet
+            c.write(remote_path,
+                    misc.read(local_path),
+                    callback=_create_adb_push_pull_callback(w))
+
+    return remote_path
+
+@context.quietfunc
 @with_device
 def read(path, target=None, callback=None):
     """Download a file from the device, and extract its contents.
@@ -460,7 +569,7 @@ def read(path, target=None, callback=None):
         target(str): Optional, location to store the file.
             Uses a temporary file by default.
         callback(callable): See the documentation for
-            ``adb.protocol.Client.read``.
+            ``adb.protocol.AdbClient.read``.
 
     Examples:
 
@@ -471,7 +580,7 @@ def read(path, target=None, callback=None):
         ...
         PwnlibException: Could not stat '/does/not/exist'
     """
-    with Client() as c:
+    with AdbClient() as c:
         stat = c.stat(path)
         if not stat:
             log.error('Could not stat %r' % path)
@@ -482,7 +591,7 @@ def read(path, target=None, callback=None):
 
     return data
 
-@context.quiet
+@context.quietfunc
 @with_device
 def write(path, data=''):
     """Create a file on the device with the provided contents.
@@ -500,14 +609,158 @@ def write(path, data=''):
         misc.write(temp.name, data)
         push(temp.name, path)
 
+@context.quietfunc
+@with_device
+def mkdir(path):
+    """Create a directory on the target device.
+
+    Note:
+        Silently succeeds if the directory already exists.
+
+    Arguments:
+        path(str): Directory to create.
+
+    Examples:
+
+        >>> adb.mkdir('/')
+
+        >>> path = '/data/local/tmp/mkdir_test'
+        >>> adb.exists(path)
+        False
+        >>> adb.mkdir(path)
+        >>> adb.exists(path)
+        True
+
+        >>> adb.mkdir('/init')
+        Traceback (most recent call last):
+        ...
+        PwnlibException: mkdir failed for /init, File exists
+    """
+    if not path.startswith('/'):
+        log.error("Must provide an absolute path: %r" % path)
+
+    with AdbClient() as c:
+        st = c.stat(path)
+
+        # Don't re-create existing directories
+        if st and stat.S_ISDIR(st['mode']):
+            return
+
+        result = process(['mkdir', path]).recvall()
+
+        # Any output at all is an error
+        if result:
+            log.error(result)
+
+@context.quietfunc
+@with_device
+def makedirs(path):
+    """Create a directory and all parent directories on the target device.
+
+    Note:
+        Silently succeeds if the directory already exists.
+
+    Examples:
+
+        >>> adb.makedirs('/data/local/tmp/this/is/a/directory/heirarchy')
+        >>> adb.listdir('/data/local/tmp/this/is/a/directory')
+        ['heirarchy']
+    """
+    if path != '/':
+        makedirs(os.path.dirname(path))
+
+    mkdir(path)
+
+@context.quietfunc
+@with_device
+def exists(path):
+    """Return :const:`True` if ``path`` exists on the target device.
+
+    Examples:
+
+        >>> adb.exists('/')
+        True
+        >>> adb.exists('/init')
+        True
+        >>> adb.exists('/does/not/exist')
+        False
+    """
+    with AdbClient() as c:
+        return bool(c.stat(path))
+
+@context.quietfunc
+@with_device
+def isdir(path):
+    """Return :const:`True` if ``path`` is a on the target device.
+
+    Examples:
+
+        >>> adb.isdir('/')
+        True
+        >>> adb.isdir('/init')
+        False
+        >>> adb.isdir('/does/not/exist')
+        False
+    """
+    with AdbClient() as c:
+        st = c.stat(path)
+        return bool(st and stat.S_ISDIR(st['mode']))
+
+@context.quietfunc
+@with_device
+def unlink(path, recursive=False):
+    """Unlinks a file or directory on the target device.
+
+    Examples:
+
+        >>> adb.unlink("/does/not/exist")
+        Traceback (most recent call last):
+        ...
+        PwnlibException: Could not unlink '/does/not/exist': Does not exist
+
+        >>> filename = '/data/local/tmp/unlink-test'
+        >>> adb.write(filename, 'hello')
+        >>> adb.exists(filename)
+        True
+        >>> adb.unlink(filename)
+        >>> adb.exists(filename)
+        False
+
+        >>> adb.mkdir(filename)
+        >>> adb.write(filename + '/contents', 'hello')
+        >>> adb.unlink(filename)
+        Traceback (most recent call last):
+        ...
+        PwnlibException: Cannot delete non-empty directory '/data/local/tmp/unlink-test' without recursive=True
+
+        >>> adb.unlink(filename, recursive=True)
+        >>> adb.exists(filename)
+        False
+    """
+    with AdbClient() as c:
+        st = c.stat(path)
+        if not st:
+            log.error("Could not unlink %r: Does not exist" % path)
+
+        # If the directory is not empty, do not delete it
+        if isdir(path) and c.list(path) and not recursive:
+            log.error("Cannot delete non-empty directory %r without recursive=True" % path)
+
+        flags = '-rf' if recursive else '-r'
+
+        output = c.execute(['rm', flags, path]).recvall()
+
+        if output:
+            log.error(output)
+
 @with_device
 def process(argv, *a, **kw):
     """Execute a process on the device.
 
-    See ``pwnlib.tubes.process.process`` documentation for more info.
+    See :class:`pwnlib.tubes.process.process` documentation for more info.
 
     Returns:
-        A ``process`` tube.
+        A :class:`pwnlib.tubes.process.process` tube.
 
     Examples:
 
@@ -524,7 +777,7 @@ def process(argv, *a, **kw):
         if argv != [argv[0]]: message += ' argv=%r ' % argv
 
     with log.progress(message) as p:
-        return Client().execute(argv)
+        return AdbClient().execute(argv)
 
 @with_device
 def interactive(**kw):
@@ -537,27 +790,59 @@ def shell(**kw):
     return process(['sh', '-i'], **kw)
 
 @with_device
-def which(name):
-    """Retrieves the full path to a binary in ``PATH`` on the device
+def which(name, all = False, *a, **kw):
+    """Retrieves the full path to a binary in ``$PATH`` on the device
 
-    >>> adb.which('sh')
-    '/system/bin/sh'
+    Arguments:
+        name(str): Binary name
+        all(bool): Whether to return all paths, or just the first
+        *a: Additional arguments for :func:`.adb.process`
+        **kw: Additional arguments for :func:`.adb.process`
+
+    Returns:
+        Either a path, or list of paths
+
+    Example:
+
+        >>> adb.which('sh')
+        '/system/bin/sh'
+        >>> adb.which('sh', all=True)
+        ['/system/bin/sh']
+
+        >>> adb.which('foobar') is None
+        True
+        >>> adb.which('foobar', all=True)
+        []
     """
     # Unfortunately, there is no native 'which' on many phones.
     which_cmd = '''
-IFS=:
-BINARY=%s
-P=($PATH)
-for path in "${P[@]}"; do \
-    if [ -e "$path/$BINARY" ]; then \
-        echo "$path/$BINARY";
-        break
-    fi
+echo $PATH | while read -d: directory; do
+    [ -x "$directory/{name}" ] || continue;
+    echo -n "$directory/{name}\\x00";
 done
-''' % name
+'''.format(name=name)
 
     which_cmd = which_cmd.strip()
-    return process(['sh','-c',which_cmd]).recvall().strip()
+    data = process(['sh','-c', which_cmd], *a, **kw).recvall()
+    result = []
+
+    for path in data.split('\x00'):
+        # Skip empty entries
+        if not path:
+            continue
+
+        # Return the first entry if all=False
+        if not all:
+            return path
+
+        # Accumulate all entries if all=True
+        result.append(path)
+
+    if all:
+        return result
+
+    return None
+
 
 @with_device
 def whoami():
@@ -570,7 +855,7 @@ def forward(port):
     start_forwarding = adb(['forward', tcp_port, tcp_port])
     atexit.register(lambda: adb(['forward', '--remove', tcp_port]))
 
-@context.quiet
+@context.quietfunc
 @with_device
 def logcat(stream=False):
     """Reads the system log file.
@@ -578,12 +863,12 @@ def logcat(stream=False):
     By default, causes logcat to exit after reading the file.
 
     Arguments:
-        stream(bool): If ``True``, the contents are streamed rather than
-            read in a one-shot manner.  Default is ``False``.
+        stream(bool): If :const:`True`, the contents are streamed rather than
+            read in a one-shot manner.  Default is :const:`False`.
 
     Returns:
-        If ``stream`` is ``False``, returns a string containing the log data.
-        Otherwise, it returns a ``tube`` connected to the log output.
+        If ``stream`` is :const:`False`, returns a string containing the log data.
+        Otherwise, it returns a :class:`pwnlib.tubes.tube.tube` connected to the log output.
     """
 
     if stream:
@@ -659,18 +944,17 @@ def listdir(directory='/'):
         Otherwise, less files may be returned due to restrictive SELinux
         policies on adbd.
     """
-    return list(sorted(Client().list(directory)))
+    return list(sorted(AdbClient().list(directory)))
 
+@with_device
 def fastboot(args, *a, **kw):
     """Executes a fastboot command.
 
     Returns:
         The command output.
     """
-    serial = context.device
-    if not serial:
-        log.error("Unknown device")
-    return tubes.process.process(['fastboot', '-s', serial] + list(args), **kw).recvall()
+    argv = ['fastboot', '-s', str(context.device)] + list(args)
+    return tubes.process.process(argv, *a, **kw).recvall()
 
 @with_device
 def fingerprint():
@@ -695,7 +979,7 @@ def unlock_bootloader():
     Note:
         This requires physical interaction with the device.
     """
-    Client().reboot_bootloader()
+    AdbClient().reboot_bootloader()
     fastboot(['oem', 'unlock'])
     fastboot(['continue'])
 
@@ -707,7 +991,7 @@ class Kernel(object):
         return self.symbols['_text']
 
     @property
-    @context.quiet
+    @context.quietfunc
     def symbols(self):
         """Returns a dictionary of kernel symbols"""
         result = {}
@@ -719,7 +1003,7 @@ class Kernel(object):
         return result
 
     @property
-    @context.quiet
+    @context.quietfunc
     def kallsyms(self):
         """Returns the raw output of kallsyms"""
         if not self._kallsyms:
@@ -730,20 +1014,20 @@ class Kernel(object):
         return self._kallsyms
 
     @property
-    @context.quiet
+    @context.quietfunc
     def version(self):
         """Returns the kernel version of the device."""
         root()
         return read('/proc/version').strip()
 
     @property
-    @context.quiet
+    @context.quietfunc
     def cmdline(self):
         root()
         return read('/proc/cmdline').strip()
 
     @property
-    @context.quiet
+    @context.quietfunc
     def lastmsg(self):
         root()
         if 'last_kmsg' in listdir('/proc'):
@@ -850,7 +1134,7 @@ _android_mk_template = '''
 LOCAL_PATH := $(call my-dir)
 
 include $(CLEAR_VARS)
-LOCAL_MODULE := poc
+LOCAL_MODULE := %(local_module)s
 LOCAL_SRC_FILES := %(local_src_files)s
 
 include $(BUILD_EXECUTABLE)
@@ -880,6 +1164,8 @@ def _generate_ndk_project(file_list, abi='arm-v7a', platform_version=21):
     # Create the directories
 
     # Populate Android.mk
+    local_module = os.path.basename(file_list[0])
+    local_module, _ = os.path.splitext(local_module)
     local_src_files = ' '.join(list(map(os.path.basename, file_list)))
     Android_mk = os.path.join(jni_directory, 'Android.mk')
     with open(Android_mk, 'w+') as f:
@@ -911,13 +1197,23 @@ def compile(source):
     if not project:
         # Realistically this should inherit from context.arch, but
         # this works for now.
-        abi = 'armeabi-v7a'
         sdk = '21'
+        abi = {
+            'aarch64': 'arm64-v8a',
+            'amd64':   'x86_64',
+            'arm':     'armeabi-v7a',
+            'i386':    'x86',
+            'mips':    'mips',
+            'mips64':  'mips64',
+        }.get(context.arch, None)
 
-        # If we have an atatched device, use its settings.
+        # If we have an attached device, use its settings.
         if context.device:
             abi = str(properties.ro.product.cpu.abi)
             sdk = str(properties.ro.build.version.sdk)
+
+        if abi is None:
+            log.error("Unknown CPU ABI")
 
         project = _generate_ndk_project(source, abi, sdk)
 
@@ -951,18 +1247,57 @@ class Partition(object):
         with log.waitfor('Fetching %r partition (%s)' % (self.name, self.path)):
             return read(self.path)
 
+@with_device
+def walk(top, topdown=True):
+    join = os.path.join
+    isdir = lambda x: stat.S_ISDIR(x['mode'])
+    client = AdbClient()
+    names = client.list(top)
+
+    dirs, nondirs = [], []
+    for name, metadata in names.items():
+        if isdir(metadata):
+            dirs.append(name)
+        else:
+            nondirs.append(name)
+
+    if topdown:
+        yield top, dirs, nondirs
+    for name in dirs:
+        new_path = join(top, name)
+        for x in walk(new_path, topdown):
+            yield x
+    if not topdown:
+        yield top, dirs, nondirs
+
+@with_device
+def find(top, name):
+    for root, dirs, files in walk(top):
+        if name in files or name in dirs:
+            yield os.path.join(root, name)
+
+@with_device
+def readlink(path):
+    path = process(['readlink', path]).recvall()
+
+    # Readlink will emit a single newline
+    # We can't use the '-n' flag since old versions don't support it
+    if path.endswith('\n'):
+        path = path[:-1]
+
+    return path
+
 class Partitions(object):
     @property
-    @context.quiet
+    @context.quietfunc
     def by_name_dir(self):
-        cmd = ['shell','find /dev/block/platform -type d -name by-name']
-        return adb(cmd).strip()
+        return next(find('/dev/block/platform','by-name'))
 
-    @context.quiet
+    @context.quietfunc
     def __dir__(self):
         return list(self)
 
-    @context.quiet
+    @context.quietfunc
     @with_device
     def __iter__(self):
         root()
@@ -971,7 +1306,8 @@ class Partitions(object):
         for name in listdir(self.by_name_dir):
             yield name
 
-    @context.quiet
+    @context.quietfunc
+    @with_device
     def __getattr__(self, attr):
         for name in self:
             if name == attr:
@@ -982,7 +1318,7 @@ class Partitions(object):
         path = os.path.join(self.by_name_dir, name)
 
         # Find the actual path of the device
-        devpath = process(['readlink', '-n', path]).recvall()
+        devpath = readlink(path)
         devname = os.path.basename(devpath)
 
         # Get the size of the partition
@@ -1036,11 +1372,11 @@ def uninstall(package, *arguments):
         package(str): Name of the package to uninstall (e.g. ``'com.foo.MyPackage'``)
         arguments: Supplementary arguments to ``'pm install'``, e.g. ``'-k'``.
     """
-    with log.progress("Installing package {}".format(package)):
+    with log.progress("Uninstalling package {}".format(package)):
         with context.quiet:
-            return process(['pm','uninstall',apk] + list(arguments)).recvall()
+            return process(['pm','uninstall',package] + list(arguments)).recvall()
 
-@context.quiet
+@context.quietfunc
 def packages():
     """Returns a list of packages installed on the system"""
     packages = process(['pm', 'list', 'packages']).recvall()

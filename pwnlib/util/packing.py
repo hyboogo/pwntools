@@ -30,12 +30,14 @@ Examples:
     >>> with context.local(endian='big'): print repr(p(0x1ff))
     '\xff\x01'
 """
+from __future__ import absolute_import
+
 import struct
 import sys
 
-from . import iters
-from ..context import LocalContext
-from ..context import context
+from pwnlib.context import LocalContext
+from pwnlib.context import context
+from pwnlib.util import iters
 
 mod = sys.modules[__name__]
 
@@ -504,7 +506,7 @@ def _flat(args, preprocessor, packer):
             raise ValueError("flat(): Flat does not support values of type %s" % type(arg))
     return ''.join(out)
 
-
+@LocalContext
 def flat(*args, **kwargs):
     """flat(*args, preprocessor = None, word_size = None, endianness = None, sign = None)
 
@@ -536,8 +538,6 @@ def flat(*args, **kwargs):
 
     preprocessor = kwargs.pop('preprocessor', lambda x: None)
     word_size    = kwargs.pop('word_size', None)
-    endianness   = kwargs.pop('endianness', None)
-    sign         = kwargs.pop('sign', None)
 
     if kwargs != {}:
         raise TypeError("flat() does not support argument %r" % kwargs.popitem()[0])
@@ -593,17 +593,16 @@ def fit(pieces=None, **kwargs):
       >>> fit({ 8: [0x41414141, 0x42424242],
       ...      20: 'CCCC'})
       'aaaabaaaAAAABBBBeaaaCCCC'
+      >>> fit({ 0x61616162: 'X'})
+      'aaaaX'
 
     """
     # HACK: To avoid circular imports we need to delay the import of `cyclic`
-    from . import cyclic
+    from pwnlib.util import cyclic
 
     filler       = kwargs.pop('filler', cyclic.de_bruijn())
     length       = kwargs.pop('length', None)
     preprocessor = kwargs.pop('preprocessor', lambda x: None)
-    word_size    = kwargs.pop('word_size', None)
-    endianness   = kwargs.pop('endianness', None)
-    sign         = kwargs.pop('sign', None)
 
     if kwargs != {}:
         raise TypeError("fit() does not support argument %r" % kwargs.popitem()[0])
@@ -618,15 +617,21 @@ def fit(pieces=None, **kwargs):
     if not pieces:
         return ''.join(filler.next() for f in range(length))
 
+    def fill(out, value):
+        while value not in out:
+            out += filler.next()
+        return out, out.index(value)
+
     # convert str keys to offsets
+    # convert large int keys to offsets
     pieces_ = dict()
     for k, v in pieces.items():
         if isinstance(k, (int, long)):
-            pass
+            # cyclic() generally starts with 'aaaa'
+            if k >= 0x61616161:
+                out, k = fill(out, pack(k))
         elif isinstance(k, str):
-            while k not in out:
-                out += filler.next()
-            k = out.index(k)
+            out, k = fill(out, k)
         else:
             raise TypeError("fit(): offset must be of type int or str, but got '%s'" % type(k))
         pieces_[k] = v
@@ -692,36 +697,33 @@ def dd(dst, src, count = 0, skip = 0, seek = 0, truncate = False):
     The seek offset of file objects will be preserved.
 
     Arguments:
-      dst: Supported types are `:class:file`, `:class:list`, `:class:tuple`,
-           `:class:str`, `:class:bytearray` and `:class:unicode`.
-      src: An iterable of byte values (characters or integers), a unicode
-           string or a file object.
-      count (int): How many bytes to copy.  If `count` is 0 or larger than
-                   ``len(src[seek:])``, all bytes until the end of `src` are
-                   copied.
-      skip (int): Offset in `dst` to copy to.
-      seek (int): Offset in `src` to copy from.
-      truncate (bool): If `:const:True`, `dst` is truncated at the last copied
-                       byte.
+        dst: Supported types are `:class:file`, `:class:list`, `:class:tuple`,
+             `:class:str`, `:class:bytearray` and `:class:unicode`.
+        src: An iterable of byte values (characters or integers), a unicode
+             string or a file object.
+        count (int): How many bytes to copy.  If `count` is 0 or larger than
+                     ``len(src[seek:])``, all bytes until the end of `src` are
+                     copied.
+        skip (int): Offset in `dst` to copy to.
+        seek (int): Offset in `src` to copy from.
+        truncate (bool): If `:const:True`, `dst` is truncated at the last copied
+                         byte.
 
     Returns:
-      A modified version of `dst`.  If `dst` is a mutable type it will be
-      modified in-place.
+        A modified version of `dst`.  If `dst` is a mutable type it will be
+        modified in-place.
 
     Examples:
-    >>> dd(tuple('Hello!'), '?', skip = 5)
-    ('H', 'e', 'l', 'l', 'o', '?')
-    >>> dd(list('Hello!'), (63,), skip = 5)
-    ['H', 'e', 'l', 'l', 'o', '?']
-    >>> write('/tmp/foo', 'A' * 10)
-    ... dd(file('/tmp/foo'), file('/dev/zero'), skip = 3, count = 4)
-    ... read('/tmp/foo')
-    'AAA\x00\x00\x00\x00AAA'
-    >>> write('/tmp/foo', 'A' * 10)
-    ... dd(file('/tmp/foo'), file('/dev/zero'), skip = 3, count = 4, truncate = True)
-    ... read('/tmp/foo')
-    'AAA\x00\x00\x00\x00'
-
+        >>> dd(tuple('Hello!'), '?', skip = 5)
+        ('H', 'e', 'l', 'l', 'o', '?')
+        >>> dd(list('Hello!'), (63,), skip = 5)
+        ['H', 'e', 'l', 'l', 'o', '?']
+        >>> file('/tmp/foo', 'w').write('A' * 10)
+        >>> dd(file('/tmp/foo'), file('/dev/zero'), skip = 3, count = 4).read()
+        'AAA\\x00\\x00\\x00\\x00AAA'
+        >>> file('/tmp/foo', 'w').write('A' * 10)
+        >>> dd(file('/tmp/foo'), file('/dev/zero'), skip = 3, count = 4, truncate = True).read()
+        'AAA\\x00\\x00\\x00\\x00'
     """
 
     # Re-open file objects to make sure we have the mode right

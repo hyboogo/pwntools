@@ -1,8 +1,12 @@
+from __future__ import absolute_import
+
 import argparse
 
-from pwn import *
+import pwnlib
+pwnlib.args.free_form = False
 
-from . import common
+from pwn import *
+from pwnlib.commandline import common
 
 p = common.parser_commands.add_parser(
     'pwnstrip',
@@ -47,4 +51,4 @@ def main(args):
     args.output.write(result)
 
 if __name__ == '__main__':
-    pwnlib.common.main(__file__)
+    pwnlib.commandline.common.main(__file__)

@@ -1,7 +1,9 @@
+from __future__ import absolute_import
+
 import argparse
 import os
 
-from . import common
+from pwnlib.commandline import common
 
 parser = common.parser_commands.add_parser(
     'errno',
@@ -42,4 +44,4 @@ def main(args):
   print os.strerror(value)
 
 if __name__ == '__main__':
-    pwnlib.common.main(__file__)
+    pwnlib.commandline.common.main(__file__)

@@ -39,14 +39,26 @@ Example:
     ...     print int(constants.SYS_stat)
     4
 
+    >>> with context.local(arch = 'i386', os = 'linux'):
+    ...    print constants.SYS_execve + constants.PROT_WRITE
+    13
+    >>> with context.local(arch = 'amd64', os = 'linux'):
+    ...    print constants.SYS_execve + constants.PROT_WRITE
+    61
+    >>> with context.local(arch = 'amd64', os = 'linux'):
+    ...    print constants.SYS_execve + constants.PROT_WRITE
+    61
+
 """
+from __future__ import absolute_import
+
 import importlib
 import sys
 from types import ModuleType
 
-from ..context import context
-from ..util import safeeval
-from .constant import Constant
+from pwnlib.constants.constant import Constant
+from pwnlib.context import context
+from pwnlib.util import safeeval
 
 
 class ConstantsModule(ModuleType):
@@ -54,19 +66,6 @@ class ConstantsModule(ModuleType):
     ModuleType specialization in order to automatically
     route queries down to the correct module based on the
     current context arch / os.
-
-        >>> with context.local(arch = 'i386', os = 'linux'):
-        ...    print constants.SYS_execve + constants.PROT_WRITE
-        13
-        >>> with context.local(arch = 'amd64', os = 'linux'):
-        ...    print constants.SYS_execve + constants.PROT_WRITE
-        61
-        >>> with context.local(arch = 'amd64', os = 'linux'):
-        ...    print constants.SYS_execve + constants.PROT_WRITE
-        61
-        >>> False
-        True
-
     """
     Constant = Constant
 
@@ -136,6 +135,11 @@ class ConstantsModule(ModuleType):
         """
         if not isinstance(string, str):
             return string
+
+        simple = getattr(self, string, None)
+
+        if simple is not None:
+            return simple
 
         key = context.os, context.arch
         if key not in self._env_store:

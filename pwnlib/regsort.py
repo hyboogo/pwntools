@@ -2,13 +2,15 @@
 """
 Topographical sort
 """
+from __future__ import absolute_import
+
 from collections import OrderedDict
 from collections import defaultdict
 from random import randint
 from random import shuffle
 
-from .context import context
-from .log import getLogger
+from pwnlib.context import context
+from pwnlib.log import getLogger
 
 log = getLogger(__name__)
 
@@ -121,7 +123,7 @@ def regsort(in_out, all_regs, tmp = None, xchg = True, randomize = None):
     If a dependency cycle is encountered, one of the following will
     occur:
 
-    - If ``xchg`` is ``True``, it is assumed that dependency cyles can
+    - If ``xchg`` is :const:`True`, it is assumed that dependency cyles can
       be broken by swapping the contents of two register (a la the
       ``xchg`` instruction on i386).
     - If ``xchg`` is not set, but not all destination registers in
@@ -165,8 +167,8 @@ def regsort(in_out, all_regs, tmp = None, xchg = True, randomize = None):
         as a temporary register, and later overwritten with its final
         value.
 
-        If ``xchg`` is ``True`` and it is used to break a dependency cycle,
-        then ``reg_name`` will be ``None`` and ``value`` will be a tuple
+        If ``xchg`` is :const:`True` and it is used to break a dependency cycle,
+        then ``reg_name`` will be :const:`None` and ``value`` will be a tuple
         of the instructions to swap.
 
     Example:
@@ -224,6 +226,8 @@ def regsort(in_out, all_regs, tmp = None, xchg = True, randomize = None):
          ('mov', 'b', 'c'),
          ('mov', 'c', 'x'),
          ('mov', 'x', '1')]
+         >>> regsort({'a': 'b', 'b': 'c'}, ['a','b','c'], xchg=0)
+         [('mov', 'a', 'b'), ('mov', 'b', 'c')]
     """
     if randomize is None:
         randomize = context.randomize
@@ -333,7 +337,9 @@ def regsort(in_out, all_regs, tmp = None, xchg = True, randomize = None):
     # If XCHG is expressly disabled, and there is no temporary register,
     # try to see if there is any register which can be used as a temp
     # register instead.
-    if not (xchg or tmp):
+    #
+    # If there are no cycles, there's no need for a temporary register.
+    if in_cycle and not (xchg or tmp):
         for reg in in_out:
             if not depends_on_cycle(reg, in_out, in_cycle):
                 tmp = reg

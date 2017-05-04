@@ -1,9 +1,11 @@
+from __future__ import absolute_import
+
 import socket
 import ssl as _ssl
 
-from ..log import getLogger
-from ..timeout import Timeout
-from .sock import sock
+from pwnlib.log import getLogger
+from pwnlib.timeout import Timeout
+from pwnlib.tubes.sock import sock
 
 log = getLogger(__name__)
 
@@ -29,10 +31,16 @@ class remote(sock):
         >>> r.send('GET /\r\n\r\n')
         >>> r.recvn(4)
         'HTTP'
+
+        If a connection cannot be made, an exception is raised.
+
         >>> r = remote('127.0.0.1', 1)
         Traceback (most recent call last):
         ...
         PwnlibException: Could not connect to 127.0.0.1 on port 1
+
+        You can also use :meth:`.remote.fromsocket` to wrap an existing socket.
+
         >>> import socket
         >>> s = socket.socket()
         >>> s.connect(('google.com', 80))
@@ -45,8 +53,8 @@ class remote(sock):
 
     def __init__(self, host, port,
                  fam = "any", typ = "tcp",
-                 timeout = Timeout.default, ssl=False, sock=None, level = None):
-        super(remote, self).__init__(timeout, level = level)
+                 ssl=False, sock=None, *args, **kwargs):
+        super(remote, self).__init__(*args, **kwargs)
 
         self.rport  = int(port)
         self.rhost  = host
@@ -65,7 +73,7 @@ class remote(sock):
             except socket.gaierror as e:
                 if e.errno != socket.EAI_NONAME:
                     raise
-                log.error('Could not resolve hostname: %r' % host)
+                self.error('Could not resolve hostname: %r' % host)
         if self.sock:
             self.settimeout(self.timeout)
             self.lhost, self.lport = self.sock.getsockname()[:2]
@@ -73,72 +81,33 @@ class remote(sock):
             if ssl:
                 self.sock = _ssl.wrap_socket(self.sock)
 
-
-    @staticmethod
-    def _get_family(fam):
-
-        if isinstance(fam, (int, long)):
-            pass
-        elif fam == 'any':
-            fam = socket.AF_UNSPEC
-        elif fam.lower() in ['ipv4', 'ip4', 'v4', '4']:
-            fam = socket.AF_INET
-        elif fam.lower() in ['ipv6', 'ip6', 'v6', '6']:
-            fam = socket.AF_INET6
-        else:
-            self.error("remote(): family %r is not supported" % fam)
-
-        return fam
-
-    @staticmethod
-    def _get_type(typ):
-
-        if isinstance(typ, (int, long)):
-            pass
-        elif typ == "tcp":
-            typ = socket.SOCK_STREAM
-        elif typ == "udp":
-            typ = socket.SOCK_DGRAM
-        else:
-            self.error("remote(): type %r is not supported" % typ)
-
-        return typ
-
     def _connect(self, fam, typ):
         sock    = None
         timeout = self.timeout
 
-        h = self.waitfor('Opening connection to %s on port %d' % (self.rhost, self.rport))
+        with self.waitfor('Opening connection to %s on port %d' % (self.rhost, self.rport)) as h:
+            for res in socket.getaddrinfo(self.rhost, self.rport, fam, typ, 0, socket.AI_PASSIVE):
+                self.family, self.type, self.proto, _canonname, sockaddr = res
 
-        for res in socket.getaddrinfo(self.rhost, self.rport, fam, typ, 0, socket.AI_PASSIVE):
-            self.family, self.type, self.proto, _canonname, sockaddr = res
+                if self.type not in [socket.SOCK_STREAM, socket.SOCK_DGRAM]:
+                    continue
 
-            if self.type not in [socket.SOCK_STREAM, socket.SOCK_DGRAM]:
-                continue
+                h.status("Trying %s" % sockaddr[0])
 
-            h.status("Trying %s" % sockaddr[0])
+                sock = socket.socket(self.family, self.type, self.proto)
 
-            sock = socket.socket(self.family, self.type, self.proto)
+                if timeout != None and timeout <= 0:
+                    sock.setblocking(0)
+                else:
+                    sock.setblocking(1)
+                    sock.settimeout(timeout)
 
-            if timeout != None and timeout <= 0:
-                sock.setblocking(0)
-            else:
-                sock.setblocking(1)
-                sock.settimeout(timeout)
-
-            try:
-                sock.connect(sockaddr)
-                break
-            except socket.error:
-                pass
-        else:
-            h.failure()
+                try:
+                    sock.connect(sockaddr)
+                    return sock
+                except socket.error:
+                    pass
             self.error("Could not connect to %s on port %d" % (self.rhost, self.rport))
-
-        h.success()
-        return sock
-
-
 
     @classmethod
     def fromsocket(cls, socket):
@@ -158,17 +127,13 @@ class remote(sock):
 
 class tcp(remote):
     __doc__ = remote.__doc__
-    def __init__(self, host, port,
-                 fam = "any", typ = "tcp",
-                 timeout = Timeout.default, ssl=False, sock=None, level = None):
-        return super(tcp, self).__init__(host, port, fam, typ, timeout, ssl, sock, level)
+    def __init__(self, host, port, *a, **kw):
+        return super(tcp, self).__init__(host, port, typ="tcp", *a, **kw)
 
 class udp(remote):
     __doc__ = remote.__doc__
-    def __init__(self, host, port,
-                 fam = "any", typ = "udp",
-                 timeout = Timeout.default, ssl=False, sock=None, level = None):
-        return super(udp, self).__init__(host, port, fam, typ, timeout, ssl, sock, level)
+    def __init__(self, host, port, *a, **kw):
+        return super(udp, self).__init__(host, port, typ="udp", *a, **kw)
 
 class connect(remote):
     __doc__ = remote.__doc__

@@ -1,8 +1,10 @@
 #!/usr/bin/env python2
+from __future__ import absolute_import
+
 import argparse
 import sys
 
-from . import common
+from pwnlib.commandline import common
 
 parser = common.parser_commands.add_parser(
     'hex',
@@ -19,4 +21,4 @@ def main(args):
         print ' '.join(args.data).encode('hex')
 
 if __name__ == '__main__':
-    pwnlib.common.main(__file__)
+    pwnlib.commandline.common.main(__file__)

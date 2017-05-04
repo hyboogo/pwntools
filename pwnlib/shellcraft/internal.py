@@ -1,5 +1,9 @@
+from __future__ import absolute_import
+
 import os
 from collections import defaultdict
+
+from pwnlib.context import context
 
 __all__ = ['make_function']
 
@@ -33,10 +37,14 @@ def init_mako():
 
     render_global = IsInside()
 
+    cache  = context.cache_dir
+    if cache:
+        cache = os.path.join(cache, 'mako')
+
     curdir = os.path.dirname(os.path.abspath(__file__))
     lookup = TemplateLookup(
         directories      = [os.path.join(curdir, 'templates')],
-        module_directory = os.path.expanduser('~/.pwntools-cache/mako')
+        module_directory = cache
     )
 
     # The purpose of this definition is to create a new Tag.
@@ -84,18 +92,21 @@ def get_context_from_dirpath(directory):
     >>> get_context_from_dirpath('amd64/linux') == {'arch': 'amd64', 'os': 'linux'}
     True
     """
-    A,O = os.path.split(directory)
+    parts = directory.split(os.path.sep)
 
-    if O == 'common':
-        O = None
+    arch = osys = None
 
-    if not A:
-        A,O = O,None
+    if len(parts) > 0:
+        arch = parts[0]
+    if len(parts) > 1:
+        osys = parts[1]
 
-    rv = {}
-    if O: rv['os']=O
-    if A: rv['arch']=A
-    return rv
+    if osys == 'common':
+        osys = None
+    if arch == 'common':
+        arch = None
+
+    return {'os': osys, 'arch': arch}
 
 def make_function(funcname, filename, directory):
     import inspect

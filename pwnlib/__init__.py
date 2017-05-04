@@ -1,6 +1,8 @@
+from __future__ import absolute_import
+
 import importlib
 
-from .version import __version__
+from pwnlib.version import __version__
 
 version = __version__
 
@@ -12,6 +14,7 @@ __all__ = [
     'commandline',
     'constants',
     'context',
+    'data',
     'dynelf',
     'encoders',
     'elf',

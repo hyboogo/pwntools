@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import absolute_import
+
 import logging
 import re
 import string
@@ -7,15 +9,15 @@ import sys
 import threading
 import time
 
-from .. import atexit
-from .. import term
-from ..context import context
-from ..log import Logger
-from ..timeout import Timeout
-from ..util import fiddling
-from ..util import misc
-from ..util import packing
-from .buffer import Buffer
+from pwnlib import atexit
+from pwnlib import term
+from pwnlib.context import context
+from pwnlib.log import Logger
+from pwnlib.timeout import Timeout
+from pwnlib.tubes.buffer import Buffer
+from pwnlib.util import fiddling
+from pwnlib.util import misc
+from pwnlib.util import packing
 
 
 class tube(Timeout, Logger):
@@ -30,18 +32,18 @@ class tube(Timeout, Logger):
     #: and related functions.
     newline = '\n'
 
-    def __init__(self, timeout = default, level = None):
+    def __init__(self, timeout = default, level = None, *a, **kw):
         super(tube, self).__init__(timeout)
 
         Logger.__init__(self, None)
         if level is not None:
             self.setLevel(level)
 
-        self.buffer          = Buffer()
+        self.buffer = Buffer(*a, **kw)
         atexit.register(self.close)
 
     # Functions based on functions from subclasses
-    def recv(self, numb = 4096, timeout = default):
+    def recv(self, numb = None, timeout = default):
         r"""recv(numb = 4096, timeout = default) -> str
 
         Receives up to `numb` bytes of data from the tube, and returns
@@ -72,6 +74,7 @@ class tube(Timeout, Logger):
             [...] Received 0xc bytes:
                 'Hello, world'
         """
+        numb = self.buffer.get_fill_size(numb)
         return self._recv(numb, timeout) or ''
 
     def unrecv(self, data):
@@ -82,19 +85,17 @@ class tube(Timeout, Logger):
 
         Examples:
 
-            .. doctest::
-
-                >>> t = tube()
-                >>> t.recv_raw = lambda n: 'hello'
-                >>> t.recv()
-                'hello'
-                >>> t.recv()
-                'hello'
-                >>> t.unrecv('world')
-                >>> t.recv()
-                'world'
-                >>> t.recv()
-                'hello'
+            >>> t = tube()
+            >>> t.recv_raw = lambda n: 'hello'
+            >>> t.recv()
+            'hello'
+            >>> t.recv()
+            'hello'
+            >>> t.unrecv('world')
+            >>> t.recv()
+            'world'
+            >>> t.recv()
+            'hello'
         """
         self.buffer.unget(data)
 
@@ -122,7 +123,7 @@ class tube(Timeout, Logger):
         data = ''
 
         with self.local(timeout):
-            data = self.recv_raw(4096)
+            data = self.recv_raw(self.buffer.get_fill_size())
 
         if data and self.isEnabledFor(logging.DEBUG):
             self.debug('Received %#x bytes:' % len(data))
@@ -141,12 +142,13 @@ class tube(Timeout, Logger):
         return data
 
 
-    def _recv(self, numb = 4096, timeout = default):
+    def _recv(self, numb = None, timeout = default):
         """_recv(numb = 4096, timeout = default) -> str
 
         Receives one chunk of from the internal buffer or from the OS if the
         buffer is empty.
         """
+        numb = self.buffer.get_fill_size(numb)
         data = ''
 
         # No buffered data, could not put anything in the buffer
@@ -212,24 +214,22 @@ class tube(Timeout, Logger):
 
         Examples:
 
-            .. doctest::
-
-                >>> t = tube()
-                >>> data = 'hello world'
-                >>> t.recv_raw = lambda *a: data
-                >>> t.recvn(len(data)) == data
-                True
-                >>> t.recvn(len(data)+1) == data + data[0]
-                True
-                >>> t.recv_raw = lambda *a: None
-                >>> # The remaining data is buffered
-                >>> t.recv() == data[1:]
-                True
-                >>> t.recv_raw = lambda *a: time.sleep(0.01) or 'a'
-                >>> t.recvn(10, timeout=0.05)
-                ''
-                >>> t.recvn(10, timeout=0.06) # doctest: +ELLIPSIS
-                'aaaaaa...'
+            >>> t = tube()
+            >>> data = 'hello world'
+            >>> t.recv_raw = lambda *a: data
+            >>> t.recvn(len(data)) == data
+            True
+            >>> t.recvn(len(data)+1) == data + data[0]
+            True
+            >>> t.recv_raw = lambda *a: None
+            >>> # The remaining data is buffered
+            >>> t.recv() == data[1:]
+            True
+            >>> t.recv_raw = lambda *a: time.sleep(0.01) or 'a'
+            >>> t.recvn(10, timeout=0.05)
+            ''
+            >>> t.recvn(10, timeout=0.06) # doctest: +ELLIPSIS
+            'aaaaaa...'
         """
         # Keep track of how much data has been received
         # It will be pasted together at the end if a
@@ -253,7 +253,7 @@ class tube(Timeout, Logger):
 
         arguments:
             delims(str,tuple): String of delimiters characters, or list of delimiter strings.
-            drop(bool): Drop the ending.  If ``True`` it is removed from the end of the return value.
+            drop(bool): Drop the ending.  If :const:`True` it is removed from the end of the return value.
 
         Raises:
             exceptions.EOFError: The connection closed before the request could be satisfied
@@ -264,30 +264,28 @@ class tube(Timeout, Logger):
 
         Examples:
 
-            .. doctest::
+            >>> t = tube()
+            >>> t.recv_raw = lambda n: "Hello World!"
+            >>> t.recvuntil(' ')
+            'Hello '
+            >>> _=t.clean(0)
+            >>> # Matches on 'o' in 'Hello'
+            >>> t.recvuntil(tuple(' Wor'))
+            'Hello'
+            >>> _=t.clean(0)
+            >>> # Matches expressly full string
+            >>> t.recvuntil(' Wor')
+            'Hello Wor'
+            >>> _=t.clean(0)
+            >>> # Matches on full string, drops match
+            >>> t.recvuntil(' Wor', drop=True)
+            'Hello'
 
-                >>> t = tube()
-                >>> t.recv_raw = lambda n: "Hello World!"
-                >>> t.recvuntil(' ')
-                'Hello '
-                >>> _=t.clean(0)
-                >>> # Matches on 'o' in 'Hello'
-                >>> t.recvuntil(tuple(' Wor'))
-                'Hello'
-                >>> _=t.clean(0)
-                >>> # Matches expressly full string
-                >>> t.recvuntil(' Wor')
-                'Hello Wor'
-                >>> _=t.clean(0)
-                >>> # Matches on full string, drops match
-                >>> t.recvuntil(' Wor', drop=True)
-                'Hello'
-
-                >>> # Try with regex special characters
-                >>> t = tube()
-                >>> t.recv_raw = lambda n: "Hello|World"
-                >>> t.recvuntil('|', drop=True)
-                'Hello'
+            >>> # Try with regex special characters
+            >>> t = tube()
+            >>> t.recv_raw = lambda n: "Hello|World"
+            >>> t.recvuntil('|', drop=True)
+            'Hello'
 
         """
         # Convert string into singleton tupple
@@ -347,7 +345,7 @@ class tube(Timeout, Logger):
 
         Arguments:
             numlines(int): Maximum number of lines to receive
-            keepends(bool): Keep newlines at the end of each line (``False``).
+            keepends(bool): Keep newlines at the end of each line (:const:`False`).
             timeout(int): Maximum timeout
 
         Raises:
@@ -359,17 +357,15 @@ class tube(Timeout, Logger):
 
         Examples:
 
-            .. doctest::
-
-                >>> t = tube()
-                >>> t.recv_raw = lambda n: '\n'
-                >>> t.recvlines(3)
-                ['', '', '']
-                >>> t.recv_raw = lambda n: 'Foo\nBar\nBaz\n'
-                >>> t.recvlines(3)
-                ['Foo', 'Bar', 'Baz']
-                >>> t.recvlines(3, True)
-                ['Foo\n', 'Bar\n', 'Baz\n']
+            >>> t = tube()
+            >>> t.recv_raw = lambda n: '\n'
+            >>> t.recvlines(3)
+            ['', '', '']
+            >>> t.recv_raw = lambda n: 'Foo\nBar\nBaz\n'
+            >>> t.recvlines(3)
+            ['Foo', 'Bar', 'Baz']
+            >>> t.recvlines(3, True)
+            ['Foo\n', 'Bar\n', 'Baz\n']
         """
         lines = []
         with self.countdown(timeout):
@@ -405,7 +401,7 @@ class tube(Timeout, Logger):
         all data is buffered and an empty string (``''``) is returned.
 
         Arguments:
-            keepends(bool): Keep the line ending (``True``).
+            keepends(bool): Keep the line ending (:const:`True`).
             timeout(int): Timeout
 
         Return:
@@ -440,20 +436,18 @@ class tube(Timeout, Logger):
 
         Arguments:
             pred(callable): Function to call.  Returns the line for which
-                this function returns ``True``.
+                this function returns :const:`True`.
 
         Examples:
 
-            .. doctest::
-
-                >>> t = tube()
-                >>> t.recv_raw = lambda n: "Foo\nBar\nBaz\n"
-                >>> t.recvline_pred(lambda line: line == "Bar\n")
-                'Bar'
-                >>> t.recvline_pred(lambda line: line == "Bar\n", keepends=True)
-                'Bar\n'
-                >>> t.recvline_pred(lambda line: line == 'Nope!', timeout=0.1)
-                ''
+            >>> t = tube()
+            >>> t.recv_raw = lambda n: "Foo\nBar\nBaz\n"
+            >>> t.recvline_pred(lambda line: line == "Bar\n")
+            'Bar'
+            >>> t.recvline_pred(lambda line: line == "Bar\n", keepends=True)
+            'Bar\n'
+            >>> t.recvline_pred(lambda line: line == 'Nope!', timeout=0.1)
+            ''
         """
 
         tmpbuf = Buffer()
@@ -486,7 +480,7 @@ class tube(Timeout, Logger):
 
         Arguments:
             items(str,tuple): List of strings to search for, or a single string.
-            keepends(bool): Return lines with newlines if ``True``
+            keepends(bool): Return lines with newlines if :const:`True`
             timeout(int): Timeout, in seconds
 
         Examples:
@@ -524,7 +518,7 @@ class tube(Timeout, Logger):
 
         Arguments:
             delims(str,tuple): List of strings to search for, or string of single characters
-            keepends(bool): Return lines with newlines if ``True``
+            keepends(bool): Return lines with newlines if :const:`True`
             timeout(int): Timeout, in seconds
 
         Returns:
@@ -532,16 +526,14 @@ class tube(Timeout, Logger):
 
         Examples:
 
-            .. doctest::
-
-                >>> t = tube()
-                >>> t.recv_raw = lambda n: "Hello\nWorld\nXylophone\n"
-                >>> t.recvline_startswith(tuple('WXYZ'))
-                'World'
-                >>> t.recvline_startswith(tuple('WXYZ'), True)
-                'Xylophone\n'
-                >>> t.recvline_startswith('Wo')
-                'World'
+            >>> t = tube()
+            >>> t.recv_raw = lambda n: "Hello\nWorld\nXylophone\n"
+            >>> t.recvline_startswith(tuple('WXYZ'))
+            'World'
+            >>> t.recvline_startswith(tuple('WXYZ'), True)
+            'Xylophone\n'
+            >>> t.recvline_startswith('Wo')
+            'World'
         """
         # Convert string into singleton tupple
         if isinstance(delims, (str, unicode)):
@@ -564,16 +556,14 @@ class tube(Timeout, Logger):
 
         Examples:
 
-            .. doctest::
-
-                >>> t = tube()
-                >>> t.recv_raw = lambda n: 'Foo\nBar\nBaz\nKaboodle\n'
-                >>> t.recvline_endswith('r')
-                'Bar'
-                >>> t.recvline_endswith(tuple('abcde'), True)
-                'Kaboodle\n'
-                >>> t.recvline_endswith('oodle')
-                'Kaboodle'
+            >>> t = tube()
+            >>> t.recv_raw = lambda n: 'Foo\nBar\nBaz\nKaboodle\n'
+            >>> t.recvline_endswith('r')
+            'Bar'
+            >>> t.recvline_endswith(tuple('abcde'), True)
+            'Kaboodle\n'
+            >>> t.recvline_endswith('oodle')
+            'Kaboodle'
         """
         # Convert string into singleton tupple
         if isinstance(delims, (str, unicode)):
@@ -1197,13 +1187,11 @@ class tube(Timeout, Logger):
 
         Examples:
 
-            .. doctest::
-
-                >>> t = tube()
-                >>> def p(x): print x
-                >>> t.close = lambda: p("Closed!")
-                >>> with t: pass
-                Closed!
+            >>> t = tube()
+            >>> def p(x): print x
+            >>> t.close = lambda: p("Closed!")
+            >>> with t: pass
+            Closed!
         """
         return self
 
@@ -1362,3 +1350,4 @@ class tube(Timeout, Logger):
     def unpack(self, *a, **kw):     return packing.unpack(self.recvn(context.bytes), *a, **kw)
 
     def flat(self, *a, **kw):       return self.send(packing.flat(*a,**kw))
+    def fit(self, *a, **kw):        return self.send(packing.fit(*a, **kw))

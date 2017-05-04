@@ -1,9 +1,13 @@
 #!/usr/bin/env python2
+from __future__ import absolute_import
+
 import subprocess
 
-from pwn import *
+import pwnlib
+pwnlib.args.free_form = False
 
-from . import common
+from pwn import *
+from pwnlib.commandline import common
 
 p = common.parser_commands.add_parser(
     'update',
@@ -21,7 +25,7 @@ p.add_argument('--pre', action='store_true', help='''
 def main(a):
     result = pwnlib.update.perform_check(prerelease=a.pre)
     if a.install:
-        subprocess.check_call(result, shell=True)
+        subprocess.check_call(result, shell=False)
 
 if __name__ == '__main__':
-    pwnlib.common.main(__file__)
+    pwnlib.commandline.common.main(__file__)
